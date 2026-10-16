@@ -21,6 +21,8 @@ pub enum Metric {
 /// A search result: which point, and how far it is from the query.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScoredPoint {
+    /// The point's id.
     pub id: PointId,
+    /// Distance to the query under the index's [`Metric`]. Lower is closer.
     pub distance: f32,
 }

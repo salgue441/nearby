@@ -15,21 +15,30 @@ use std::path::Path;
 /// Vectors stored back to back, all with the same dimension.
 #[derive(Debug)]
 pub struct Vectors {
+    /// Number of values in each vector. Always at least 1.
     pub dim: usize,
+    /// All vectors concatenated; `data.len()` is a multiple of `dim`.
     pub data: Vec<f32>,
 }
 
 impl Vectors {
+    /// Number of vectors.
     pub fn len(&self) -> usize {
         self.data.len() / self.dim
     }
 
+    /// Iterates over the vectors, each as a `dim`-long slice.
     pub fn iter(&self) -> std::slice::ChunksExact<'_, f32> {
         self.data.chunks_exact(self.dim)
     }
 }
 
 /// Reads a `.fvecs` file (base vectors or queries).
+///
+/// # Errors
+///
+/// If the file cannot be read, is empty, declares a dimension of 0, is
+/// truncated, or mixes records of different dimensions.
 pub fn read_fvecs(path: &Path) -> anyhow::Result<Vectors> {
     let bytes = read_file(path)?;
     let (dim, data) = parse_vecs(&bytes, f32::from_le_bytes)
@@ -39,6 +48,12 @@ pub fn read_fvecs(path: &Path) -> anyhow::Result<Vectors> {
 }
 
 /// Reads an `.ivecs` file (ground truth: the ids of each query's true neighbors).
+///
+/// Values are read as `u32`, since ids are never negative.
+///
+/// # Errors
+///
+/// Same as [`read_fvecs`].
 pub fn read_ivecs(path: &Path) -> anyhow::Result<Vec<Vec<u32>>> {
     let bytes = read_file(path)?;
     let (dim, flat) = parse_vecs(&bytes, u32::from_le_bytes)

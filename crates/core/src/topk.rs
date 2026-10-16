@@ -12,7 +12,10 @@ use crate::types::{PointId, ScoredPoint};
 ///
 /// `f32::total_cmp` defines an order for every value (NaN sorts after infinity),
 /// which is all a heap needs. Vectors are validated at the API boundary, so NaN
-/// distance don't happen in practice.
+/// distances don't happen in practice.
+///
+/// Equality follows the same total order, so unlike `f32`, `-0.0 != 0.0`
+/// and `NaN == NaN` here.
 #[derive(Debug, Clone, Copy)]
 pub struct OrdF32(pub f32);
 
@@ -50,6 +53,23 @@ struct Entry {
 /// sits on top. Checking whether a new candidate belongs is O(1), and
 /// replacing the worst is O(log k). Over N candidates that's O(N log k),
 /// instead of O(N log N) for sorting everything.
+///
+/// Candidates at the same distance are ranked by ascending id, so results
+/// are deterministic regardless of insertion order.
+///
+/// # Examples
+///
+/// ```
+/// use nearby_core::TopK;
+///
+/// let mut top = TopK::new(2);
+/// top.push(1, 0.9);
+/// top.push(2, 0.1);
+/// top.push(3, 0.5);
+///
+/// let ids: Vec<u64> = top.into_sorted().iter().map(|p| p.id).collect();
+/// assert_eq!(ids, [2, 3]);
+/// ```
 #[derive(Debug, Clone)]
 pub struct TopK {
     k: usize,
@@ -57,6 +77,10 @@ pub struct TopK {
 }
 
 impl TopK {
+    /// Creates an empty collector that keeps at most `k` candidates.
+    ///
+    /// Memory for `k` entries is reserved up front. With `k == 0`, every
+    /// candidate is rejected.
     pub fn new(k: usize) -> Self {
         Self {
             k,
@@ -64,14 +88,17 @@ impl TopK {
         }
     }
 
+    /// The maximum number of candidates kept.
     pub fn k(&self) -> usize {
         self.k
     }
 
+    /// Number of candidates currently kept. Never more than [`TopK::k`].
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
+    /// True if no candidate has been kept yet.
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
@@ -91,6 +118,10 @@ impl TopK {
     }
 
     /// Offers a candidate. Returns `true` if it was kept.
+    ///
+    /// While not full, every candidate is kept. Once full, a candidate is
+    /// kept only if it ranks strictly better than [`TopK::worst`] (closer,
+    /// or equally close with a smaller id), and it evicts that worst one.
     pub fn push(&mut self, id: PointId, distance: f32) -> bool {
         let entry = Entry {
             distance: OrdF32(distance),

@@ -25,16 +25,25 @@ pub fn recall_at_k(results: &[ScoredPoint], truth: &[u32], k: usize) -> f64 {
 /// Summary of per-query latencies.
 #[derive(Debug, Clone)]
 pub struct LatencyStats {
+    /// Number of samples.
     pub count: usize,
+    /// Sum of all samples.
     pub total: Duration,
+    /// Arithmetic mean.
     pub mean: Duration,
+    /// Median (nearest-rank).
     pub p50: Duration,
+    /// 95th percentile (nearest-rank).
     pub p95: Duration,
+    /// 99th percentile (nearest-rank).
     pub p99: Duration,
+    /// Slowest sample.
     pub max: Duration,
 }
 
 impl LatencyStats {
+    /// Summarizes `samples`, in any order.
+    ///
     /// Returns `None` if there are no samples.
     pub fn from_samples(mut samples: Vec<Duration>) -> Option<Self> {
         let max = *samples.iter().max()?;
@@ -55,6 +64,8 @@ impl LatencyStats {
     }
 
     /// Queries per second, for queries run one after another on one thread.
+    ///
+    /// Infinite if every sample was zero.
     pub fn qps(&self) -> f64 {
         self.count as f64 / self.total.as_secs_f64()
     }

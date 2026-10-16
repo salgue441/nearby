@@ -7,6 +7,26 @@
 use crate::VectorIndex;
 use nearby_core::{Metric, PointId, Result, ScoredPoint, TopK, validate_vector};
 
+/// An exact (brute-force) vector index.
+///
+/// Vectors are stored back to back in one contiguous buffer, which keeps a
+/// full scan cache-friendly. Ids live in a parallel `Vec`: the vector at
+/// position `i` belongs to `ids[i]`.
+///
+/// # Examples
+///
+/// ```
+/// use nearby_core::Metric;
+/// use nearby_index::{FlatIndex, VectorIndex};
+///
+/// let mut index = FlatIndex::new(2, Metric::L2);
+/// index.add(1, &[0.0, 0.0])?;
+/// index.add(2, &[5.0, 5.0])?;
+///
+/// let results = index.search(&[1.0, 1.0], 1)?;
+/// assert_eq!(results[0].id, 1);
+/// # Ok::<(), nearby_core::Error>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct FlatIndex {
     dim: usize,
@@ -51,7 +71,12 @@ impl FlatIndex {
     ///
     /// # Errors
     ///
-    /// If `vector` has the wrong length or contains NaN/infinite values.
+    /// [`Error::DimensionMismatch`] if `vector` has the wrong length, or
+    /// [`Error::InvalidVector`] if it contains NaN or infinite values.
+    /// On error the index is left unchanged.
+    ///
+    /// [`Error::DimensionMismatch`]: nearby_core::Error::DimensionMismatch
+    /// [`Error::InvalidVector`]: nearby_core::Error::InvalidVector
     pub fn add(&mut self, id: PointId, vector: &[f32]) -> Result<()> {
         validate_vector(vector, self.dim)?;
         self.data.extend_from_slice(vector);

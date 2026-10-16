@@ -1,6 +1,6 @@
 //! The crate-wide error type.
 //!
-//! Library code returns `nearby::Result<T>`. Binaries can wrap
+//! Library code returns `nearby_core::Result<T>`. Binaries can wrap
 //! it with `anyhow` to add context, but the library itself
 //! never uses `anyhow`, so callers can `match` on specific
 //! variants.
@@ -10,31 +10,64 @@ use std::path::PathBuf;
 /// `Result` with [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Every error the `nearby` library crates can return.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// A vector's length does not match the dimension of the index or
+    /// collection it was given to.
     #[error("dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
+    DimensionMismatch {
+        /// The dimension the index or collection was created with.
+        expected: usize,
+        /// The length of the vector that was passed in.
+        got: usize,
+    },
 
+    /// A vector contains NaN or an infinity, which would make every
+    /// distance computed from it meaningless.
     #[error("vector contains NaN or infinite values")]
     InvalidVector,
 
+    /// No point with this id exists.
     #[error("point `{0}` not found")]
     PointNotFound(u64),
 
+    /// No collection with this name exists.
     #[error("collection `{0}` not found")]
     CollectionNotFound(String),
 
+    /// On-disk data failed an integrity check (bad magic, checksum, length...).
+    ///
+    /// Build it with [`Error::corruption`].
     #[error("corrupted data in {}: {reason}", path.display())]
-    Corruption { path: PathBuf, reason: String },
+    Corruption {
+        /// The file that failed the check.
+        path: PathBuf,
+        /// What was wrong with it, for humans.
+        reason: String,
+    },
 
+    /// A configuration value is invalid.
     #[error("invalid config: {0}")]
     Config(String),
 
+    /// An I/O operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 impl Error {
+    /// Shorthand for building [`Error::Corruption`] from anything path-like
+    /// and string-like.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nearby_core::Error;
+    ///
+    /// let err = Error::corruption("seg-0001.seg", "bad magic");
+    /// assert_eq!(err.to_string(), "corrupted data in seg-0001.seg: bad magic");
+    /// ```
     pub fn corruption(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
         Self::Corruption {
             path: path.into(),

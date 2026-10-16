@@ -30,6 +30,15 @@ pub struct LogGuard {
 }
 
 /// Install the global logger. Call once, at the top of `main`.
+///
+/// The filter comes from `RUST_LOG` if it is set and valid, otherwise from
+/// [`LogConfig::level`]. Console and file output are enabled independently.
+///
+/// # Errors
+///
+/// If `cfg.level` is not a valid filter directive, the log directory cannot
+/// be created, the log file cannot be opened, or a global logger is already
+/// installed.
 pub fn init_logging(cfg: &LogConfig) -> anyhow::Result<LogGuard> {
     let filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,

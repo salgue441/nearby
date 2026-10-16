@@ -12,6 +12,17 @@ use crate::types::Metric;
 impl Metric {
     /// Distance between `a` and `b` under this metric.
     /// Lower means closer.
+    ///
+    /// With [`Metric::Dot`] the result can be negative.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use nearby_core::Metric;
+    ///
+    /// assert_eq!(Metric::L2.distance(&[0.0, 0.0], &[3.0, 4.0]), 25.0);
+    /// assert_eq!(Metric::Dot.distance(&[1.0, 2.0], &[3.0, 4.0]), -11.0);
+    /// ```
     #[inline]
     pub fn distance(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
@@ -65,6 +76,16 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 }
 
 /// Scales `v` in place to unit length. Leaves a zero vector unchanged.
+///
+/// # Examples
+///
+/// ```
+/// use nearby_core::distance::normalize;
+///
+/// let mut v = [3.0, 4.0];
+/// normalize(&mut v);
+/// assert_eq!(v, [0.6, 0.8]);
+/// ```
 ///
 /// For unit vectors, cosine distance is just `1 - dot`, so normalizing once
 /// at insert time makes every later comparison cheaper.
