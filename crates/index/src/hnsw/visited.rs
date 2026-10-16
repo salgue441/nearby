@@ -27,6 +27,12 @@ impl VisitedSet {
         }
     }
 
+    /// Whether `node` was visited in the current search. Doesn't mark it.
+    #[inline]
+    pub(super) fn contains(&self, node: u32) -> bool {
+        self.marks[node as usize] == self.generation
+    }
+
     /// Marks `node` as visited. Returns `true` if it wasn't visited before.
     #[inline]
     pub(super) fn insert(&mut self, node: u32) -> bool {
@@ -48,8 +54,11 @@ mod tests {
     fn insert_reports_first_visit_only() {
         let mut v = VisitedSet::default();
         v.reset(10);
+        assert!(!v.contains(3));
         assert!(v.insert(3));
         assert!(!v.insert(3));
+        assert!(v.contains(3), "contains sees the mark");
+        assert!(!v.contains(4), "contains does not mark");
         assert!(v.insert(4));
     }
 

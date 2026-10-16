@@ -107,7 +107,15 @@ impl<'a> SearchCtx<'a> {
             if results.is_full() && results.worst().is_some_and(|worst| distance > worst) {
                 break;
             }
-            for &next in self.graph.neighbors(node, level) {
+            let links = self.graph.neighbors(node, level);
+            // Start loading every unvisited neighbor before measuring any of
+            // them, so the memory reads overlap (see `VectorStore::prefetch`).
+            for &next in links {
+                if !visited.contains(next) {
+                    self.store.prefetch(next as usize);
+                }
+            }
+            for &next in links {
                 if !visited.insert(next) {
                     continue;
                 }
