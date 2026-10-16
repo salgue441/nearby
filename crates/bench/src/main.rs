@@ -28,7 +28,8 @@ usage: nearby-bench [DATASET_DIR] [OPTIONS]
   --k N                    neighbors per query (default: 10)
   --m N                    HNSW links per node (default: 16)
   --ef-construction N      HNSW build quality (default: 200)
-  --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)";
+  --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)
+                           (a search uses at least k, so smaller values run as k)";
 
 /// Which indexes to build and query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +96,14 @@ fn main() -> anyhow::Result<()> {
             start.elapsed(),
             hnsw.max_level() + 1
         );
-        for &ef in &args.ef_search {
+        let sweep = effective_ef(&args.ef_search, args.k);
+        if sweep != args.ef_search {
+            println!(
+                "note     a search uses ef >= k, so values below k = {} run as {}",
+                args.k, args.k
+            );
+        }
+        for ef in sweep {
             hnsw.set_ef_search(ef);
             rows.push((format!("hnsw ef={ef}"), run_queries(&hnsw, &data, args.k)?));
         }
@@ -124,6 +132,21 @@ fn main() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// The `ef_search` values that will actually run, in the order requested.
+///
+/// A search uses `max(ef_search, k)`, so values below `k` are raised to `k`.
+/// Duplicates that result are dropped, so every reported row is distinct and
+/// labeled with the `ef` it really used.
+fn effective_ef(requested: &[usize], k: usize) -> Vec<usize> {
+    let mut sweep = Vec::with_capacity(requested.len());
+    for ef in requested.iter().map(|&ef| ef.max(k)) {
+        if !sweep.contains(&ef) {
+            sweep.push(ef);
+        }
+    }
+    sweep
 }
 
 /// Formats a latency for the results table, e.g. `412.35µs`.
@@ -162,7 +185,8 @@ fn run_queries(
 /// # Errors
 ///
 /// On an unknown option or index, a missing or non-numeric value, `--k 0`,
-/// or an empty `--ef` list. Messages include [`USAGE`].
+/// or an `--ef` list that is empty or contains 0. Errors about unknown or
+/// incomplete options include [`USAGE`].
 fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Args>> {
     let mut args = Args {
         dir: PathBuf::from("data/siftsmall"),
@@ -205,6 +229,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
     }
     ensure!(args.k > 0, "--k must be at least 1");
     ensure!(!args.ef_search.is_empty(), "--ef needs at least one value");
+    ensure!(
+        args.ef_search.iter().all(|&ef| ef > 0),
+        "--ef values must be at least 1"
+    );
     Ok(Some(args))
 }
 
@@ -282,7 +310,7 @@ mod tests {
 
     #[test]
     fn errors_explain_the_problem() {
-        let cases: [(&[&str], &str); 7] = [
+        let cases: [(&[&str], &str); 8] = [
             (&["--index", "ivf"], "unknown index `ivf`"),
             (&["--frobnicate"], "unknown option `--frobnicate`"),
             (&["--k"], "--k needs a value"),
@@ -290,6 +318,7 @@ mod tests {
             (&["--k", "-3"], "`-3` is not"),
             (&["--k", "0"], "--k must be at least 1"),
             (&["--ef", "10,,20"], "`` is not"),
+            (&["--ef", "10,0"], "--ef values must be at least 1"),
         ];
         for (args, expected) in cases {
             let err = format!("{:#}", parse(args).unwrap_err());
@@ -326,6 +355,18 @@ mod tests {
         let (recall, stats) = run_queries(&flat, &data, 2).unwrap();
         assert!((recall - 1.0).abs() < 1e-9);
         assert_eq!(stats.count, 2);
+    }
+
+    #[test]
+    fn effective_ef_raises_values_below_k_and_drops_repeats() {
+        assert_eq!(effective_ef(&[10, 20, 40, 80], 10), vec![10, 20, 40, 80]);
+        assert_eq!(effective_ef(&[10, 20, 40, 160], 50), vec![50, 160]);
+        assert_eq!(
+            effective_ef(&[200, 100], 1),
+            vec![200, 100],
+            "order is kept"
+        );
+        assert_eq!(effective_ef(&[5, 5], 1), vec![5]);
     }
 
     #[test]
