@@ -1,6 +1,7 @@
 //! Recall and throughput benchmark on the TEXMEX SIFT datasets.
 //!
-//! Usage: `cargo run -p nearby-bench --release -- [dataset dir] [k]`
+//! Usage: `cargo run -p nearby-bench --release -- [DATASET_DIR] [OPTIONS]`
+//! (run with `--help` for the options).
 //!
 //! The dataset directory defaults to `data/siftsmall` and must contain
 //! `<name>_base.fvecs`, `<name>_query.fvecs` and `<name>_groundtruth.ivecs`,
@@ -12,99 +13,208 @@ mod metrics;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, ensure};
+use anyhow::{Context, bail, ensure};
 use nearby_core::{Metric, PointId};
-use nearby_index::{FlatIndex, VectorIndex};
+use nearby_index::{FlatIndex, Hnsw, HnswParams, VectorIndex};
 
-use crate::dataset::VecsReader;
+use crate::dataset::Dataset;
 use crate::metrics::{LatencyStats, recall_at_k};
 
+const USAGE: &str = "\
+usage: nearby-bench [DATASET_DIR] [OPTIONS]
+
+  DATASET_DIR              default: data/siftsmall
+  --index flat|hnsw|both   which index to benchmark (default: both)
+  --k N                    neighbors per query (default: 10)
+  --m N                    HNSW links per node (default: 16)
+  --ef-construction N      HNSW build quality (default: 200)
+  --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)";
+
+/// Which indexes to build and query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexChoice {
+    Flat,
+    Hnsw,
+    Both,
+}
+
+/// Parsed command line. See [`USAGE`] for each option's meaning and default.
+#[derive(Debug, PartialEq)]
+struct Args {
+    dir: PathBuf,
+    index: IndexChoice,
+    k: usize,
+    m: usize,
+    ef_construction: usize,
+    /// One result row is reported per value.
+    ef_search: Vec<usize>,
+}
+
 fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let dir = args
-        .next()
-        .map_or_else(|| PathBuf::from("data/siftsmall"), PathBuf::from);
-    let k: usize = args
-        .next()
-        .map(|s| s.parse())
-        .transpose()
-        .context("k must be a positive integer")?
-        .unwrap_or(10);
-    ensure!(k > 0, "k must be at least 1");
+    let Some(args) = parse_args(std::env::args().skip(1))? else {
+        println!("{USAGE}");
+        return Ok(());
+    };
+    let data = Dataset::load(&args.dir, args.k)?;
+    println!(
+        "dataset  {}: {} base vectors, {} queries, dim {}\n",
+        data.name,
+        data.base.len(),
+        data.queries.len(),
+        data.base.dim
+    );
 
-    // ---- Load ---------------------------------------------------------------
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("dataset path has no directory name")?;
-    // The base set is the big one: it's streamed straight into the index
-    // below, so it is never held in memory twice. Opening it here only
-    // reads the header.
-    let base_path = dir.join(format!("{name}_base.fvecs"));
-    let mut base = VecsReader::open_fvecs(&base_path)?;
-    let queries = dataset::read_fvecs(&dir.join(format!("{name}_query.fvecs")))?;
-    let truth = dataset::read_ivecs(&dir.join(format!("{name}_groundtruth.ivecs")))?;
+    let mut rows = Vec::new();
 
-    ensure!(
-        queries.dim == base.dim(),
-        "queries have dimension {}, base vectors have {}",
-        queries.dim,
-        base.dim()
-    );
-    ensure!(
-        truth.len() == queries.len(),
-        "{} ground-truth rows for {} queries",
-        truth.len(),
-        queries.len()
-    );
-    ensure!(
-        truth.iter().all(|row| row.len() >= k),
-        "ground truth has fewer than k = {k} neighbors per query"
-    );
+    if args.index != IndexChoice::Hnsw {
+        let start = Instant::now();
+        let mut flat = FlatIndex::with_capacity(data.base.dim, Metric::L2, data.base.len());
+        for (i, vector) in data.base.iter().enumerate() {
+            flat.add(i as PointId, vector)?;
+        }
+        println!("build    flat: {:.2?}", start.elapsed());
+        rows.push(("flat".to_owned(), run_queries(&flat, &data, args.k)?));
+    }
+
+    if args.index != IndexChoice::Flat {
+        let params = HnswParams {
+            m: args.m,
+            m0: 2 * args.m,
+            ef_construction: args.ef_construction,
+            ..HnswParams::default()
+        };
+        let start = Instant::now();
+        let mut hnsw = Hnsw::with_capacity(data.base.dim, Metric::L2, params, data.base.len())?;
+        for (i, vector) in data.base.iter().enumerate() {
+            hnsw.insert(i as PointId, vector)?;
+        }
+        println!(
+            "build    hnsw (m={}, ef_construction={}): {:.2?}, {} layers",
+            args.m,
+            args.ef_construction,
+            start.elapsed(),
+            hnsw.max_level() + 1
+        );
+        for &ef in &args.ef_search {
+            hnsw.set_ef_search(ef);
+            rows.push((format!("hnsw ef={ef}"), run_queries(&hnsw, &data, args.k)?));
+        }
+    }
 
     println!(
-        "dataset    {name}: {} base vectors, {} queries, dim {}",
-        base.len(),
-        queries.len(),
-        base.dim()
+        "\n{:<14} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "index",
+        format!("recall@{}", args.k),
+        "qps",
+        "mean",
+        "p50",
+        "p95",
+        "p99",
+        "max"
     );
-
-    // ---- Build --------------------------------------------------------------
-    // Includes reading the base file. Flat "building" is just a copy, so
-    // timing it separately would mostly measure the timer.
-    let start = Instant::now();
-    let mut index = FlatIndex::with_capacity(base.dim(), Metric::L2, base.len());
-    let mut id: PointId = 0;
-    while let Some(vector) = base
-        .next_vector()
-        .with_context(|| format!("parsing {}", base_path.display()))?
-    {
-        index.add(id, vector)?;
-        id += 1;
+    for (label, (recall, stats)) in &rows {
+        println!(
+            "{label:<14} {recall:>9.4} {:>9.0} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            stats.qps(),
+            fmt_duration(stats.mean),
+            fmt_duration(stats.p50),
+            fmt_duration(stats.p95),
+            fmt_duration(stats.p99),
+            fmt_duration(stats.max)
+        );
     }
-    let build_time = start.elapsed();
+    Ok(())
+}
 
-    // ---- Search -------------------------------------------------------------
-    let mut latencies = Vec::with_capacity(queries.len());
+/// Formats a latency for the results table, e.g. `412.35µs`.
+fn fmt_duration(d: std::time::Duration) -> String {
+    format!("{d:.2?}")
+}
+
+/// Runs every query once and returns the mean recall@k and latency stats.
+///
+/// # Errors
+///
+/// If a search fails, or the dataset has no queries.
+fn run_queries(
+    index: &dyn VectorIndex,
+    data: &Dataset,
+    k: usize,
+) -> anyhow::Result<(f64, LatencyStats)> {
+    let mut latencies = Vec::with_capacity(data.queries.len());
     let mut recall_sum = 0.0;
-    for (query, true_ids) in queries.iter().zip(&truth) {
+    for (query, truth) in data.queries.iter().zip(&data.truth) {
         let start = Instant::now();
         let results = index.search(query, k)?;
         latencies.push(start.elapsed());
-        recall_sum += recall_at_k(&results, true_ids, k);
+        recall_sum += recall_at_k(&results, truth, k);
     }
-    let recall = recall_sum / queries.len() as f64;
     let stats = LatencyStats::from_samples(latencies).context("the query file is empty")?;
+    Ok((recall_sum / data.queries.len() as f64, stats))
+}
 
-    // ---- Report -------------------------------------------------------------
-    println!("index      flat (exact), L2");
-    println!("build      {build_time:.2?} (load + insert)");
-    println!("recall@{k:<3} {recall:.4}");
-    println!("qps        {:.0}", stats.qps());
-    println!(
-        "latency    mean {:.2?} | p50 {:.2?} | p95 {:.2?} | p99 {:.2?} | max {:.2?}",
-        stats.mean, stats.p50, stats.p95, stats.p99, stats.max
-    );
+/// Parses command-line arguments (without the program name).
+///
+/// Returns `None` if `-h` or `--help` was given, so the caller can print
+/// [`USAGE`] and exit. Taking the arguments as a parameter, instead of
+/// reading `std::env::args()` here, keeps this testable.
+///
+/// # Errors
+///
+/// On an unknown option or index, a missing or non-numeric value, `--k 0`,
+/// or an empty `--ef` list. Messages include [`USAGE`].
+fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Args>> {
+    let mut args = Args {
+        dir: PathBuf::from("data/siftsmall"),
+        index: IndexChoice::Both,
+        k: 10,
+        m: 16,
+        ef_construction: 200,
+        ef_search: vec![10, 20, 40, 80, 160, 320],
+    };
+    let mut it = raw.into_iter();
+    while let Some(arg) = it.next() {
+        let mut value = |flag: &str| {
+            it.next()
+                .with_context(|| format!("{flag} needs a value\n\n{USAGE}"))
+        };
+        match arg.as_str() {
+            "--index" => {
+                args.index = match value("--index")?.as_str() {
+                    "flat" => IndexChoice::Flat,
+                    "hnsw" => IndexChoice::Hnsw,
+                    "both" => IndexChoice::Both,
+                    other => bail!("unknown index `{other}`\n\n{USAGE}"),
+                }
+            }
+            "--k" => args.k = parse_number(&value("--k")?)?,
+            "--m" => args.m = parse_number(&value("--m")?)?,
+            "--ef-construction" => {
+                args.ef_construction = parse_number(&value("--ef-construction")?)?;
+            }
+            "--ef" => {
+                args.ef_search = value("--ef")?
+                    .split(',')
+                    .map(parse_number)
+                    .collect::<anyhow::Result<_>>()?;
+            }
+            "-h" | "--help" => return Ok(None),
+            flag if flag.starts_with('-') => bail!("unknown option `{flag}`\n\n{USAGE}"),
+            _ => args.dir = PathBuf::from(arg),
+        }
+    }
+    ensure!(args.k > 0, "--k must be at least 1");
+    ensure!(!args.ef_search.is_empty(), "--ef needs at least one value");
+    Ok(Some(args))
+}
 
-    Ok(())
+/// Parses one numeric option value, ignoring surrounding whitespace.
+///
+/// # Errors
+///
+/// If `s` is not a non-negative integer that fits in `usize`.
+fn parse_number(s: &str) -> anyhow::Result<usize> {
+    s.trim()
+        .parse()
+        .with_context(|| format!("`{s}` is not a positive integer"))
 }

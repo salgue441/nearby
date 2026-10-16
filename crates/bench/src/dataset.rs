@@ -244,6 +244,67 @@ impl<R: Read, T> VecsReader<R, T> {
     }
 }
 
+/// A benchmark dataset: base vectors, queries, and each query's true neighbors.
+#[derive(Debug)]
+pub struct Dataset {
+    /// The directory's name, which prefixes every file in it (`siftsmall`).
+    pub name: String,
+    /// The vectors to index.
+    pub base: Vectors,
+    /// The vectors to search for. Same dimension as `base`.
+    pub queries: Vectors,
+    /// `truth[q]` = ids of query `q`'s nearest base vectors, closest first.
+    pub truth: Vec<Vec<u32>>,
+}
+
+impl Dataset {
+    /// Loads `<dir>/<name>_base.fvecs`, `<name>_query.fvecs` and
+    /// `<name>_groundtruth.ivecs`, where `<name>` is the directory's own name,
+    /// and checks that the three files agree with each other.
+    ///
+    /// The whole base set is loaded into memory, so it can be inserted into
+    /// several indexes.
+    ///
+    /// # Errors
+    ///
+    /// If `dir` has no usable name, a file is missing or malformed, the query
+    /// and base dimensions differ, there isn't one ground-truth row per
+    /// query, or a row has fewer than `k` neighbors.
+    pub fn load(dir: &Path, k: usize) -> anyhow::Result<Self> {
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("dataset path has no directory name")?
+            .to_owned();
+        let base = read_fvecs(&dir.join(format!("{name}_base.fvecs")))?;
+        let queries = read_fvecs(&dir.join(format!("{name}_query.fvecs")))?;
+        let truth = read_ivecs(&dir.join(format!("{name}_groundtruth.ivecs")))?;
+
+        ensure!(
+            queries.dim == base.dim,
+            "queries have dimension {}, base vectors have {}",
+            queries.dim,
+            base.dim
+        );
+        ensure!(
+            truth.len() == queries.len(),
+            "{} ground-truth rows for {} queries",
+            truth.len(),
+            queries.len()
+        );
+        ensure!(
+            truth.iter().all(|row| row.len() >= k),
+            "ground truth has fewer than k = {k} neighbors per query"
+        );
+        Ok(Self {
+            name,
+            base,
+            queries,
+            truth,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
