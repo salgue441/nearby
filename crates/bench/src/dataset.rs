@@ -12,7 +12,7 @@
 use anyhow::{Context, ensure};
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Vectors stored back to back, all with the same dimension.
 #[derive(Debug)]
@@ -245,25 +245,29 @@ impl<R: Read, T> VecsReader<R, T> {
 }
 
 /// A benchmark dataset: base vectors, queries, and each query's true neighbors.
+///
+/// Queries and ground truth are small and loaded whole. The base set is the
+/// big one, so it stays on disk and is streamed with
+/// [`Dataset::for_each_base_chunk`] each time an index is built. It never
+/// sits in memory next to an index, and an index can be dropped before the
+/// next one is built, so peak memory is that of the largest single index.
 #[derive(Debug)]
 pub struct Dataset {
     /// The directory's name, which prefixes every file in it (`siftsmall`).
     pub name: String,
-    /// The vectors to index.
-    pub base: Vectors,
-    /// The vectors to search for. Same dimension as `base`.
+    /// The vectors to search for. Same dimension as the base vectors.
     pub queries: Vectors,
     /// `truth[q]` = ids of query `q`'s nearest base vectors, closest first.
     pub truth: Vec<Vec<u32>>,
+    base_path: PathBuf,
+    dim: usize,
+    base_len: usize,
 }
 
 impl Dataset {
-    /// Loads `<dir>/<name>_base.fvecs`, `<name>_query.fvecs` and
-    /// `<name>_groundtruth.ivecs`, where `<name>` is the directory's own name,
-    /// and checks that the three files agree with each other.
-    ///
-    /// The whole base set is loaded into memory, so it can be inserted into
-    /// several indexes.
+    /// Loads `<dir>/<name>_query.fvecs` and `<name>_groundtruth.ivecs`, reads
+    /// the header of `<name>_base.fvecs`, where `<name>` is the directory's
+    /// own name, and checks that the three files agree with each other.
     ///
     /// # Errors
     ///
@@ -276,15 +280,16 @@ impl Dataset {
             .and_then(|n| n.to_str())
             .context("dataset path has no directory name")?
             .to_owned();
-        let base = read_fvecs(&dir.join(format!("{name}_base.fvecs")))?;
+        let base_path = dir.join(format!("{name}_base.fvecs"));
+        let base = VecsReader::open_fvecs(&base_path)?;
         let queries = read_fvecs(&dir.join(format!("{name}_query.fvecs")))?;
         let truth = read_ivecs(&dir.join(format!("{name}_groundtruth.ivecs")))?;
 
         ensure!(
-            queries.dim == base.dim,
+            queries.dim == base.dim(),
             "queries have dimension {}, base vectors have {}",
             queries.dim,
-            base.dim
+            base.dim()
         );
         ensure!(
             truth.len() == queries.len(),
@@ -298,10 +303,68 @@ impl Dataset {
         );
         Ok(Self {
             name,
-            base,
             queries,
             truth,
+            base_path,
+            dim: base.dim(),
+            base_len: base.len(),
         })
+    }
+
+    /// Number of values in each vector.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Number of base vectors.
+    pub fn base_len(&self) -> usize {
+        self.base_len
+    }
+
+    /// Reads the base vectors from disk, front to back, in chunks of up to
+    /// `max` vectors stored back to back, and calls `f(first, chunk)` for
+    /// each. `first` is the position of the chunk's first vector in the file.
+    ///
+    /// Each call reads the file again, so it can be called once per index.
+    ///
+    /// # Panics
+    ///
+    /// If `max` is 0.
+    ///
+    /// # Errors
+    ///
+    /// If the base file can't be read or parsed, no longer matches the shape
+    /// seen by [`Dataset::load`], or `f` fails. File errors name the file.
+    pub fn for_each_base_chunk(
+        &self,
+        max: usize,
+        mut f: impl FnMut(usize, &[f32]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        assert!(max > 0, "chunks must hold at least one vector");
+        let context = || format!("parsing {}", self.base_path.display());
+        let mut reader = VecsReader::open_fvecs(&self.base_path)?;
+        ensure!(
+            (reader.dim(), reader.len()) == (self.dim, self.base_len),
+            "{} changed since it was loaded",
+            self.base_path.display()
+        );
+
+        let mut chunk = Vec::with_capacity(max * self.dim);
+        let mut first = 0;
+        loop {
+            chunk.clear();
+            while chunk.len() < max * self.dim {
+                match reader.next_vector().with_context(context)? {
+                    Some(vector) => chunk.extend_from_slice(vector),
+                    None => break,
+                }
+            }
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            f(first, &chunk)?;
+            first += chunk.len() / self.dim;
+        }
     }
 }
 
@@ -595,9 +658,94 @@ mod tests {
 
         let data = Dataset::load(&dir, 3).unwrap();
         assert_eq!(data.name, "tiny");
-        assert_eq!((data.base.len(), data.base.dim), (3, 2));
+        assert_eq!((data.base_len(), data.dim()), (3, 2));
         assert_eq!(data.queries.len(), 1);
         assert_eq!(data.truth, vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn base_vectors_stream_in_chunks() {
+        let root = tempfile::tempdir().unwrap();
+        let base: Vec<[f32; 1]> = (0..5u8).map(|i| [f32::from(i)]).collect();
+        let refs: Vec<&[f32]> = base.iter().map(|v| &v[..]).collect();
+        let dir = write_dataset(root.path(), "chunks", &refs, &[&[0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+
+        let mut seen = Vec::new();
+        data.for_each_base_chunk(2, |first, chunk| {
+            seen.push((first, chunk.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            vec![(0, vec![0.0, 1.0]), (2, vec![2.0, 3.0]), (4, vec![4.0])]
+        );
+    }
+
+    #[test]
+    fn base_can_be_streamed_again() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_dataset(root.path(), "twice", &[&[1.0], &[2.0]], &[&[0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+        for _ in 0..2 {
+            let mut total = 0;
+            data.for_each_base_chunk(10, |_, chunk| {
+                total += chunk.len();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(total, 2);
+        }
+    }
+
+    #[test]
+    fn base_chunk_errors_stop_the_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_dataset(root.path(), "stop", &[&[1.0], &[2.0]], &[&[0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+        let mut calls = 0;
+        let err = data
+            .for_each_base_chunk(1, |_, _| {
+                calls += 1;
+                anyhow::bail!("index full")
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(err.to_string(), "index full");
+    }
+
+    #[test]
+    fn base_read_errors_name_the_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_dataset(root.path(), "bad", &[&[1.0], &[2.0]], &[&[0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+        // Corrupt the second record's dimension header (same file size).
+        let path = dir.join("bad_base.fvecs");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[8..12].copy_from_slice(&7u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = data.for_each_base_chunk(10, |_, _| Ok(())).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("bad_base.fvecs") && err.contains("record 1"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn base_changed_since_load_is_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_dataset(root.path(), "grew", &[&[1.0]], &[&[0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+        write_dataset(root.path(), "grew", &[&[1.0], &[2.0]], &[&[0.0]], &[&[0]]);
+
+        let err = data.for_each_base_chunk(10, |_, _| Ok(())).unwrap_err();
+        assert!(
+            err.to_string().contains("changed since it was loaded"),
+            "got: {err}"
+        );
     }
 
     #[test]

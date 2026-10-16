@@ -11,13 +11,13 @@ mod dataset;
 mod metrics;
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use nearby_core::{Metric, PointId};
 use nearby_index::{FlatIndex, Hnsw, HnswParams, VectorIndex};
 
-use crate::dataset::Dataset;
+use crate::dataset::{Dataset, Vectors};
 use crate::metrics::{LatencyStats, recall_at_k};
 
 const USAGE: &str = "\
@@ -30,6 +30,10 @@ usage: nearby-bench [DATASET_DIR] [OPTIONS]
   --ef-construction N      HNSW build quality (default: 200)
   --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)
                            (a search uses at least k, so smaller values run as k)";
+
+/// Base vectors read from disk at a time while building. Small enough to
+/// add no meaningful memory, large enough that timing each chunk is cheap.
+const BUILD_CHUNK: usize = 4096;
 
 /// Which indexes to build and query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,24 +61,26 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     let data = Dataset::load(&args.dir, args.k)?;
+    let (dim, len) = (data.dim(), data.base_len());
     println!(
-        "dataset  {}: {} base vectors, {} queries, dim {}\n",
+        "dataset  {}: {len} base vectors, {} queries, dim {dim}\n",
         data.name,
-        data.base.len(),
         data.queries.len(),
-        data.base.dim
     );
 
+    // Each index is built from its own pass over the base file, queried, and
+    // dropped before the next one is built, so peak memory is that of the
+    // largest single index.
     let mut rows = Vec::new();
 
     if args.index != IndexChoice::Hnsw {
-        let start = Instant::now();
-        let mut flat = FlatIndex::with_capacity(data.base.dim, Metric::L2, data.base.len());
-        for (i, vector) in data.base.iter().enumerate() {
-            flat.add(i as PointId, vector)?;
-        }
-        println!("build    flat: {:.2?}", start.elapsed());
-        rows.push(("flat".to_owned(), run_queries(&flat, &data, args.k)?));
+        let mut flat = FlatIndex::with_capacity(dim, Metric::L2, len);
+        let build_time = build(&data, |id, vector| flat.add(id, vector))?;
+        println!("build    flat: {build_time:.2?}");
+        rows.push((
+            "flat".to_owned(),
+            run_queries(&flat, &data.queries, &data.truth, args.k)?,
+        ));
     }
 
     if args.index != IndexChoice::Flat {
@@ -84,16 +90,12 @@ fn main() -> anyhow::Result<()> {
             ef_construction: args.ef_construction,
             ..HnswParams::default()
         };
-        let start = Instant::now();
-        let mut hnsw = Hnsw::with_capacity(data.base.dim, Metric::L2, params, data.base.len())?;
-        for (i, vector) in data.base.iter().enumerate() {
-            hnsw.insert(i as PointId, vector)?;
-        }
+        let mut hnsw = Hnsw::with_capacity(dim, Metric::L2, params, len)?;
+        let build_time = build(&data, |id, vector| hnsw.insert(id, vector))?;
         println!(
-            "build    hnsw (m={}, ef_construction={}): {:.2?}, {} layers",
+            "build    hnsw (m={}, ef_construction={}): {build_time:.2?}, {} layers",
             args.m,
             args.ef_construction,
-            start.elapsed(),
             hnsw.max_level() + 1
         );
         let sweep = effective_ef(&args.ef_search, args.k);
@@ -105,7 +107,10 @@ fn main() -> anyhow::Result<()> {
         }
         for ef in sweep {
             hnsw.set_ef_search(ef);
-            rows.push((format!("hnsw ef={ef}"), run_queries(&hnsw, &data, args.k)?));
+            rows.push((
+                format!("hnsw ef={ef}"),
+                run_queries(&hnsw, &data.queries, &data.truth, args.k)?,
+            ));
         }
     }
 
@@ -134,6 +139,33 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Streams the base vectors into an index through `insert`, which receives
+/// each vector's position in the file as its id. Returns the time spent in
+/// `insert` alone, excluding file reads.
+///
+/// Inserts are timed per chunk, not per vector: a flat insert is a short
+/// copy, and timing each one would mostly measure the timer.
+///
+/// # Errors
+///
+/// If reading the base file or an insert fails.
+fn build(
+    data: &Dataset,
+    mut insert: impl FnMut(PointId, &[f32]) -> nearby_core::Result<()>,
+) -> anyhow::Result<Duration> {
+    let dim = data.dim();
+    let mut elapsed = Duration::ZERO;
+    data.for_each_base_chunk(BUILD_CHUNK, |first, chunk| {
+        let start = Instant::now();
+        for (offset, vector) in chunk.chunks_exact(dim).enumerate() {
+            insert((first + offset) as PointId, vector)?;
+        }
+        elapsed += start.elapsed();
+        Ok(())
+    })?;
+    Ok(elapsed)
+}
+
 /// The `ef_search` values that will actually run, in the order requested.
 ///
 /// A search uses `max(ef_search, k)`, so values below `k` are raised to `k`.
@@ -156,24 +188,27 @@ fn fmt_duration(d: std::time::Duration) -> String {
 
 /// Runs every query once and returns the mean recall@k and latency stats.
 ///
+/// `truths[q]` is query `q`'s ground truth, closest first.
+///
 /// # Errors
 ///
 /// If a search fails, or the dataset has no queries.
 fn run_queries(
     index: &dyn VectorIndex,
-    data: &Dataset,
+    queries: &Vectors,
+    truths: &[Vec<u32>],
     k: usize,
 ) -> anyhow::Result<(f64, LatencyStats)> {
-    let mut latencies = Vec::with_capacity(data.queries.len());
+    let mut latencies = Vec::with_capacity(queries.len());
     let mut recall_sum = 0.0;
-    for (query, truth) in data.queries.iter().zip(&data.truth) {
+    for (query, truth) in queries.iter().zip(truths) {
         let start = Instant::now();
         let results = index.search(query, k)?;
         latencies.push(start.elapsed());
         recall_sum += recall_at_k(&results, truth, k);
     }
     let stats = LatencyStats::from_samples(latencies).context("the query file is empty")?;
-    Ok((recall_sum / data.queries.len() as f64, stats))
+    Ok((recall_sum / queries.len() as f64, stats))
 }
 
 /// Parses command-line arguments (without the program name).
@@ -250,7 +285,6 @@ fn parse_number(s: &str) -> anyhow::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::Vectors;
 
     fn parse(args: &[&str]) -> anyhow::Result<Option<Args>> {
         parse_args(args.iter().map(|&s| s.to_owned()))
@@ -334,25 +368,17 @@ mod tests {
 
     #[test]
     fn run_queries_on_an_exact_index_has_perfect_recall() {
-        let base = Vectors {
-            dim: 1,
-            data: vec![0.0, 10.0, 20.0, 30.0],
-        };
-        let data = Dataset {
-            name: "line".to_owned(),
-            queries: Vectors {
-                dim: 1,
-                data: vec![1.0, 29.0],
-            },
-            truth: vec![vec![0, 1], vec![3, 2]],
-            base,
-        };
         let mut flat = FlatIndex::new(1, Metric::L2);
-        for (i, v) in data.base.iter().enumerate() {
-            flat.add(i as PointId, v).unwrap();
+        for (id, x) in [0.0, 10.0, 20.0, 30.0].into_iter().enumerate() {
+            flat.add(id as PointId, &[x]).unwrap();
         }
+        let queries = Vectors {
+            dim: 1,
+            data: vec![1.0, 29.0],
+        };
+        let truth = vec![vec![0, 1], vec![3, 2]];
 
-        let (recall, stats) = run_queries(&flat, &data, 2).unwrap();
+        let (recall, stats) = run_queries(&flat, &queries, &truth, 2).unwrap();
         assert!((recall - 1.0).abs() < 1e-9);
         assert_eq!(stats.count, 2);
     }
@@ -367,6 +393,32 @@ mod tests {
             "order is kept"
         );
         assert_eq!(effective_ef(&[5, 5], 1), vec![5]);
+    }
+
+    #[test]
+    fn build_inserts_every_base_vector_with_its_position_as_id() {
+        // 5000 one-dimensional vectors: more than one BUILD_CHUNK.
+        let n = 5_000u32;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = |value: [u8; 4]| [1u32.to_le_bytes(), value].concat();
+        let base: Vec<u8> = (0..n)
+            .flat_map(|i| record((i as f32).to_le_bytes()))
+            .collect();
+        std::fs::write(dir.join("line_base.fvecs"), base).unwrap();
+        std::fs::write(dir.join("line_query.fvecs"), record(0f32.to_le_bytes())).unwrap();
+        std::fs::write(
+            dir.join("line_groundtruth.ivecs"),
+            record(0u32.to_le_bytes()),
+        )
+        .unwrap();
+        let data = Dataset::load(&dir, 1).unwrap();
+
+        let mut flat = FlatIndex::new(1, Metric::L2);
+        build(&data, |id, v| flat.add(id, v)).unwrap();
+        assert_eq!(flat.len(), n as usize);
+        assert_eq!(flat.get(4_321), Some(&[4_321.0][..]));
     }
 
     #[test]
