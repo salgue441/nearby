@@ -1,12 +1,21 @@
 //! Vector index algorithms.
 //!
-//! Today this is exact (flat) search only; HNSW and product quantization
-//! are planned and will implement the same [`VectorIndex`] trait.
+//! - [`FlatIndex`]: exact search. Slow on large data, but always correct,
+//!   so it is the ground truth the approximate indexes are measured against.
+//! - [`Hnsw`]: approximate search over a layered proximity graph. Much
+//!   faster on large data; recall is tuned with [`HnswParams`].
+//!
+//! Product quantization is planned and will implement the same
+//! [`VectorIndex`] trait.
 
 use nearby_core::{Result, ScoredPoint};
 
 mod flat;
+mod hnsw;
+mod store;
+
 pub use flat::FlatIndex;
+pub use hnsw::{Hnsw, HnswParams};
 
 /// What every index can do once it's built.
 ///

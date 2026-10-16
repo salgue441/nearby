@@ -36,6 +36,11 @@ pub enum Error {
     #[error("collection `{0}` not found")]
     CollectionNotFound(String),
 
+    /// A constructor or setting got a value it can't work with
+    /// (e.g. HNSW `m = 1`).
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
+
     /// On-disk data failed an integrity check (bad magic, checksum, length...).
     ///
     /// Build it with [`Error::corruption`].
