@@ -4,9 +4,9 @@ A vector database written in Rust, built from first principles: exact search
 first, then approximate indexes (HNSW, product quantization), persistence
 and a server.
 
-**Status:** early. Exact (flat) search, the distance kernels, the benchmark
-harness and the server's config and logging work. The engine, storage and
-the approximate indexes are not implemented yet.
+**Status:** early. Exact (flat) search, approximate search with HNSW, the
+distance kernels, the benchmark harness and the server's config and logging
+work. Product quantization, the engine and storage are not implemented yet.
 
 ## Architecture
 
@@ -29,7 +29,7 @@ point downward, toward `nearby-core`.
 | Crate | Kind | Responsibility |
 |---|---|---|
 | `nearby-core` | library | Shared types (`PointId`, `Metric`, `ScoredPoint`), the error type, distance kernels and the `TopK` collector. Only code that two or more crates need lives here. |
-| `nearby-index` | library | The `VectorIndex` trait and its implementations. Today: `FlatIndex` (exact search). Planned: HNSW, PQ. |
+| `nearby-index` | library | The `VectorIndex` trait and its implementations: `FlatIndex` (exact search) and `Hnsw` (approximate search). Planned: PQ. |
 | `nearby-engine` | library | *Planned.* Collections, the id map and query execution on top of indexes and storage. |
 | `nearby-storage` | library | *Planned.* Segments, the write-ahead log and recovery. |
 | `nearby-server` | binary | Loads config and sets up logging. The network API is not implemented yet. |
@@ -68,6 +68,48 @@ ground truth that approximate indexes are measured against.
 The distance kernels are portable scalar code that keeps 8 independent running
 sums, which lets the compiler vectorize them.
 
+### Approximate search (`Hnsw`)
+
+`Hnsw` implements Hierarchical Navigable Small World graphs (Malkov &
+Yashunin, 2016). Every vector is a node linked to its nearest neighbors on
+layer 0; a random few also live on higher, sparser layers that act as express
+lanes. A search starts at the top layer, moves greedily toward the query,
+drops a layer whenever it can't get closer, and finishes with a wider search
+on layer 0. That costs roughly O(log N) distance computations instead of O(N),
+in exchange for recall below 1.0.
+
+- **Layout.** Each vector gets a dense `u32` node id (its insertion position).
+  Layer-0 links, where searches spend most of their time, live in one flat
+  array with `m0` slots per node; the sparse upper layers use per-node lists.
+- **Neighbor selection** uses the paper's heuristic (Algorithm 4): a
+  candidate is dropped if a neighbor already chosen is strictly closer to it
+  than the new node is. That spreads links across directions, so searches can
+  escape tight clusters. Ties are kept, as in hnswlib.
+- **Cosine comparisons cost one dot product.** With `Metric::Cosine`, each
+  vector's norm is stored at insert time and the query's norm is computed once
+  per search, instead of recomputing both norms on every comparison.
+- **Searches don't allocate visited sets.** Each one borrows a reusable set
+  from a pool, and a generation counter clears it in O(1). Searches take
+  `&self`, so many threads can search one index at once.
+- **Builds are reproducible.** Layers are drawn from a seeded `SplitMix64`, so
+  the same vectors, insertion order and seed always give the same graph.
+
+`HnswParams` holds the knobs:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `m` | 16 | Links per node on upper layers. More: better recall, more memory, slower inserts. |
+| `m0` | 32 | Links per node on layer 0, usually `2 * m`. At most 1024. |
+| `ef_construction` | 200 | Candidates considered per insert. Higher builds a better graph, more slowly. |
+| `ef_search` | 64 | Candidates considered per search: the recall/speed dial. Change it any time with `set_ef_search`; a search always uses at least its `k`. |
+| `seed` | `0x5EED` | Seed for layer assignment. |
+
+**Known limitation:** many *identical* vectors degrade reachability. They all
+tie at distance 0 and link to the same few nodes, and later copies lose their
+incoming links when those nodes' lists are pruned: with 100 copies among 400
+random vectors, about a third of the copies can be found. This is inherent to
+HNSW (hnswlib behaves the same way), so deduplicate before indexing.
+
 ## Building and testing
 
 The project builds on the stable toolchain (see `rust-toolchain.toml`).
@@ -89,9 +131,10 @@ API.
 
 ## Benchmark
 
-`nearby-bench` builds an index from a dataset's base vectors, runs every query
-and reports recall against the dataset's ground truth, plus throughput and
-latency.
+`nearby-bench` builds a flat index, an HNSW index or both from a dataset's
+base vectors, runs every query and reports recall against the dataset's
+ground truth, plus throughput and latency. For HNSW it sweeps several
+`ef_search` values, so one run shows the whole recall/speed trade-off.
 
 ### Getting a dataset
 
@@ -117,19 +160,25 @@ already extract in that layout.
 ### Running
 
 ```sh
-cargo run -p nearby-bench --release -- [dataset dir] [k]
+cargo run -p nearby-bench --release -- [DATASET_DIR] [OPTIONS]
 ```
 
-- `dataset dir` defaults to `data/siftsmall`.
-- `k` is the number of neighbors per query. It defaults to `10` and must not
-  exceed the number of ground-truth neighbors per query (100 for the TEXMEX
-  sets).
+| Option | Default | Meaning |
+|---|---|---|
+| `DATASET_DIR` | `data/siftsmall` | Dataset directory (see above). |
+| `--index flat\|hnsw\|both` | `both` | Which indexes to build and query. |
+| `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
+| `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
+| `--ef-construction N` | `200` | HNSW candidates per insert. |
+| `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, each at least 1; one result row each. A search always uses at least `k`, so values below `k` run as `k`; the bench says so and labels each row with the `ef` it actually used. |
+| `-h`, `--help` | | Print usage. |
 
 Always use `--release`: debug builds are many times slower and the numbers
 are meaningless.
 
 ```sh
-cargo run -p nearby-bench --release -- data/sift 100
+cargo run -p nearby-bench --release -- data/sift --k 100 --ef 100,200,400
+cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 ```
 
 The distance kernels speed up another ~20% when compiled for your exact CPU
@@ -143,25 +192,37 @@ RUSTFLAGS="-C target-cpu=native" cargo run -p nearby-bench --release
 ### Output
 
 ```text
-dataset    siftsmall: 10000 base vectors, 100 queries, dim 128
-index      flat (exact), L2
-build      ... (load + insert)
-recall@10  1.0000
-qps        ...
-latency    mean ... | p50 ... | p95 ... | p99 ... | max ...
+dataset  siftsmall: 10000 base vectors, 100 queries, dim 128
+
+build    flat: ...
+build    hnsw (m=16, ef_construction=200): ..., ... layers
+
+index          recall@10       qps       mean        p50        p95        p99        max
+flat              1.0000       ...        ...        ...        ...        ...        ...
+hnsw ef=10           ...       ...        ...        ...        ...        ...        ...
+hnsw ef=20           ...       ...        ...        ...        ...        ...        ...
+...
 ```
 
-- **build**: time to stream the base file into the index. For a flat index,
-  inserting is just a copy, so this is mostly read time.
+- **build**: time to insert every base vector. For the flat index that's a
+  copy; for HNSW it's the graph construction, and the line also reports the
+  number of layers.
 - **recall@k**: the average fraction of each query's true `k` nearest
   neighbors found among the first `k` results. The flat index is exact, so
-  anything below 1.0000 is a bug.
+  anything below 1.0000 there is a bug. For HNSW, recall rises with `ef`.
 - **qps**: queries per second, run one after another on a single thread.
-- **latency**: per-query latency. Percentiles use the nearest-rank method.
+- **mean … max**: per-query latency. Percentiles use the nearest-rank method.
   Tail latencies (p95, p99) are what the slowest requests experience.
 
-Base vectors are streamed straight into the index, so peak memory is about
-the size of the index, not twice the base file.
+HNSW recall depends heavily on the data. Real embeddings and descriptors such
+as SIFT are clustered and reach high recall at small `ef`. Uniformly random
+high-dimensional vectors are a worst case: all points are nearly equidistant,
+so the same settings give much lower recall.
+
+The base file is streamed from disk, in chunks, each time an index is built,
+and each index is dropped before the next one is built. So the base set
+never sits in memory next to an index, and peak memory is about that of the
+largest single index, whichever `--index` is chosen.
 
 ## Server
 
