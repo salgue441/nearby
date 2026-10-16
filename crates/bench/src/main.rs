@@ -16,6 +16,7 @@ use anyhow::{Context, ensure};
 use nearby_core::{Metric, PointId};
 use nearby_index::{FlatIndex, VectorIndex};
 
+use crate::dataset::VecsReader;
 use crate::metrics::{LatencyStats, recall_at_k};
 
 fn main() -> anyhow::Result<()> {
@@ -36,15 +37,19 @@ fn main() -> anyhow::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .context("dataset path has no directory name")?;
-    let base = dataset::read_fvecs(&dir.join(format!("{name}_base.fvecs")))?;
+    // The base set is the big one: it's streamed straight into the index
+    // below, so it is never held in memory twice. Opening it here only
+    // reads the header.
+    let base_path = dir.join(format!("{name}_base.fvecs"));
+    let mut base = VecsReader::open_fvecs(&base_path)?;
     let queries = dataset::read_fvecs(&dir.join(format!("{name}_query.fvecs")))?;
     let truth = dataset::read_ivecs(&dir.join(format!("{name}_groundtruth.ivecs")))?;
 
     ensure!(
-        queries.dim == base.dim,
+        queries.dim == base.dim(),
         "queries have dimension {}, base vectors have {}",
         queries.dim,
-        base.dim
+        base.dim()
     );
     ensure!(
         truth.len() == queries.len(),
@@ -61,14 +66,21 @@ fn main() -> anyhow::Result<()> {
         "dataset    {name}: {} base vectors, {} queries, dim {}",
         base.len(),
         queries.len(),
-        base.dim
+        base.dim()
     );
 
     // ---- Build --------------------------------------------------------------
+    // Includes reading the base file. Flat "building" is just a copy, so
+    // timing it separately would mostly measure the timer.
     let start = Instant::now();
-    let mut index = FlatIndex::with_capacity(base.dim, Metric::L2, base.len());
-    for (i, vector) in base.iter().enumerate() {
-        index.add(i as PointId, vector)?;
+    let mut index = FlatIndex::with_capacity(base.dim(), Metric::L2, base.len());
+    let mut id: PointId = 0;
+    while let Some(vector) = base
+        .next_vector()
+        .with_context(|| format!("parsing {}", base_path.display()))?
+    {
+        index.add(id, vector)?;
+        id += 1;
     }
     let build_time = start.elapsed();
 
@@ -86,7 +98,7 @@ fn main() -> anyhow::Result<()> {
 
     // ---- Report -------------------------------------------------------------
     println!("index      flat (exact), L2");
-    println!("build      {build_time:.2?}");
+    println!("build      {build_time:.2?} (load + insert)");
     println!("recall@{k:<3} {recall:.4}");
     println!("qps        {:.0}", stats.qps());
     println!(

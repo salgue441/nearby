@@ -10,6 +10,8 @@
 //! ```
 
 use anyhow::{Context, ensure};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 /// Vectors stored back to back, all with the same dimension.
@@ -33,17 +35,19 @@ impl Vectors {
     }
 }
 
-/// Reads a `.fvecs` file (base vectors or queries).
+/// Reads a `.fvecs` file (base vectors or queries) into memory.
+///
+/// For files too big to hold twice (once here, once in an index), stream
+/// them with [`VecsReader::open_fvecs`] instead.
 ///
 /// # Errors
 ///
 /// If the file cannot be read, is empty, declares a dimension of 0, is
 /// truncated, or mixes records of different dimensions.
 pub fn read_fvecs(path: &Path) -> anyhow::Result<Vectors> {
-    let bytes = read_file(path)?;
-    let (dim, data) = parse_vecs(&bytes, f32::from_le_bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
-
+    let mut reader = VecsReader::open_fvecs(path)?;
+    let dim = reader.dim();
+    let data = read_all(&mut reader).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Vectors { dim, data })
 }
 
@@ -55,15 +59,35 @@ pub fn read_fvecs(path: &Path) -> anyhow::Result<Vectors> {
 ///
 /// Same as [`read_fvecs`].
 pub fn read_ivecs(path: &Path) -> anyhow::Result<Vec<Vec<u32>>> {
-    let bytes = read_file(path)?;
-    let (dim, flat) = parse_vecs(&bytes, u32::from_le_bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let (file, len) = open(path)?;
+    let mut reader = VecsReader::new(
+        BufReader::with_capacity(READ_BUFFER, file),
+        len,
+        u32::from_le_bytes,
+    )
+    .with_context(|| format!("parsing {}", path.display()))?;
 
-    Ok(flat.chunks_exact(dim).map(<[u32]>::to_vec).collect())
+    let mut rows = Vec::with_capacity(reader.len());
+    while let Some(row) = reader
+        .next_vector()
+        .with_context(|| format!("parsing {}", path.display()))?
+    {
+        rows.push(row.to_vec());
+    }
+    Ok(rows)
 }
 
-fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
-    std::fs::read(path).with_context(|| {
+/// Read buffer size. Large enough that per-record reads are cheap copies.
+const READ_BUFFER: usize = 1 << 20;
+
+/// Opens `path` and returns it with its size in bytes.
+fn open(path: &Path) -> anyhow::Result<(File, u64)> {
+    let open = || -> std::io::Result<(File, u64)> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok((file, len))
+    };
+    open().with_context(|| {
         format!(
             "reading {} (is the dataset extracted into data/?)",
             path.display()
@@ -71,37 +95,153 @@ fn read_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     })
 }
 
-/// Parses the shared record layout. `convert` turns each value's 4 bytes into `T`.
-/// Returns the dimension and all values back to back.
-fn parse_vecs<T>(bytes: &[u8], convert: fn([u8; 4]) -> T) -> anyhow::Result<(usize, Vec<T>)> {
-    let (header, _) = bytes
-        .split_first_chunk::<4>()
-        .context("file is too short to contain a header")?;
+/// Drains `reader` into one flat `Vec`, sized exactly up front.
+fn read_all<R: Read, T: Copy>(reader: &mut VecsReader<R, T>) -> anyhow::Result<Vec<T>> {
+    let total = reader
+        .len()
+        .checked_mul(reader.dim())
+        .context("file too large")?;
+    let mut values = Vec::with_capacity(total);
+    while let Some(vector) = reader.next_vector()? {
+        values.extend_from_slice(vector);
+    }
+    Ok(values)
+}
 
-    let dim = u32::from_le_bytes(*header) as usize;
-    ensure!(dim > 0, "dimension is 0");
+/// Streams the records of a `.fvecs` / `.ivecs` file one at a time.
+///
+/// The header and file size are checked up front, so [`VecsReader::dim`] and
+/// [`VecsReader::len`] are known before any vector is read. Memory use is one
+/// record, however large the file, which lets the bench feed base vectors
+/// straight into an index without holding a second copy of the dataset.
+///
+/// Not an [`Iterator`]: each vector borrows the reader's internal buffer,
+/// which the next call overwrites.
+pub struct VecsReader<R, T> {
+    reader: R,
+    convert: fn([u8; 4]) -> T,
+    dim: usize,
+    count: usize,
+    /// Index of the next record to read.
+    next: usize,
+    /// Raw bytes of the current record, header included.
+    record: Vec<u8>,
+    /// The current record's values, converted.
+    vector: Vec<T>,
+}
 
-    let record_len = 4 * (1 + dim);
-    ensure!(
-        bytes.len().is_multiple_of(record_len),
-        "file size {} is not a multiple of the record size {record_len} (truncated file?)",
-        bytes.len()
-    );
+impl<R, T> std::fmt::Debug for VecsReader<R, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VecsReader")
+            .field("dim", &self.dim)
+            .field("count", &self.count)
+            .field("next", &self.next)
+            .finish_non_exhaustive()
+    }
+}
 
-    let mut values = Vec::with_capacity(bytes.len() / record_len * dim);
-    for (i, record) in bytes.chunks_exact(record_len).enumerate() {
-        let (words, _) = record.as_chunks::<4>();
-        let record_dim = u32::from_le_bytes(words[0]) as usize;
+impl VecsReader<BufReader<File>, f32> {
+    /// Opens a `.fvecs` file for streaming.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be opened, or its header or size is invalid (see
+    /// [`VecsReader::new`]).
+    pub fn open_fvecs(path: &Path) -> anyhow::Result<Self> {
+        let (file, len) = open(path)?;
+        Self::new(
+            BufReader::with_capacity(READ_BUFFER, file),
+            len,
+            f32::from_le_bytes,
+        )
+        .with_context(|| format!("parsing {}", path.display()))
+    }
+}
 
+impl<R: Read, T> VecsReader<R, T> {
+    /// Reads the first header from `reader`, which holds `len` bytes in all.
+    /// `convert` turns each value's 4 bytes into `T`.
+    ///
+    /// # Errors
+    ///
+    /// If `len` is too short for a header, the dimension is 0, or `len` is
+    /// not a whole number of records.
+    pub fn new(mut reader: R, len: u64, convert: fn([u8; 4]) -> T) -> anyhow::Result<Self> {
+        ensure!(len >= 4, "file is too short to contain a header");
+        let mut header = [0u8; 4];
+        reader.read_exact(&mut header).context("reading header")?;
+
+        let dim = u32::from_le_bytes(header) as usize;
+        ensure!(dim > 0, "dimension is 0");
+
+        let record_len = 4 * (1 + dim as u64);
         ensure!(
-            record_dim == dim,
-            "record {i} has dimension {record_dim}, expected {dim}"
+            len.is_multiple_of(record_len),
+            "file size {len} is not a multiple of the record size {record_len} (truncated file?)"
         );
 
-        values.extend(words[1..].iter().copied().map(convert));
+        // The first record's header has been consumed; keep it in place so
+        // the first record is checked like every other one.
+        let mut record = vec![0u8; usize::try_from(record_len)?];
+        record[..4].copy_from_slice(&header);
+
+        Ok(Self {
+            reader,
+            convert,
+            dim,
+            count: usize::try_from(len / record_len)?,
+            next: 0,
+            record,
+            vector: Vec::with_capacity(dim),
+        })
     }
 
-    Ok((dim, values))
+    /// Number of values in each vector. Always at least 1.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Total number of vectors in the file, including ones already read.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Reads the next vector, or returns `None` after the last one.
+    ///
+    /// # Errors
+    ///
+    /// If the reader fails or ends early, or the record declares a
+    /// different dimension than the first one.
+    pub fn next_vector(&mut self) -> anyhow::Result<Option<&[T]>> {
+        if self.next == self.count {
+            return Ok(None);
+        }
+
+        let i = self.next;
+        let unread = if i == 0 {
+            &mut self.record[4..]
+        } else {
+            &mut self.record[..]
+        };
+        self.reader
+            .read_exact(unread)
+            .with_context(|| format!("reading record {i}"))?;
+
+        let (words, _) = self.record.as_chunks::<4>();
+        let record_dim = u32::from_le_bytes(words[0]) as usize;
+        ensure!(
+            record_dim == self.dim,
+            "record {i} has dimension {record_dim}, expected {}",
+            self.dim
+        );
+
+        self.vector.clear();
+        self.vector
+            .extend(words[1..].iter().copied().map(self.convert));
+        self.next += 1;
+
+        Ok(Some(&self.vector))
+    }
 }
 
 #[cfg(test)]
@@ -121,10 +261,140 @@ mod tests {
         bytes
     }
 
+    /// Reads every vector from `reader`, which claims to hold `len` bytes.
+    fn parse_from(reader: impl Read, len: u64) -> anyhow::Result<(usize, Vec<f32>)> {
+        let mut reader = VecsReader::new(reader, len, f32::from_le_bytes)?;
+        let dim = reader.dim();
+        Ok((dim, read_all(&mut reader)?))
+    }
+
+    /// Parses an in-memory `.fvecs` file.
+    fn parse(bytes: &[u8]) -> anyhow::Result<(usize, Vec<f32>)> {
+        parse_from(bytes, bytes.len() as u64)
+    }
+
+    /// A reader that returns at most one byte per `read` call, the worst
+    /// case `read_exact` has to handle.
+    struct OneByteAtATime<'a>(&'a [u8]);
+
+    impl Read for OneByteAtATime<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let Some((&first, rest)) = self.0.split_first() else {
+                return Ok(0);
+            };
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = first;
+            self.0 = rest;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn short_reads_are_handled() {
+        let bytes = encode(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
+        let (dim, data) = parse_from(OneByteAtATime(&bytes), bytes.len() as u64).unwrap();
+        assert_eq!(dim, 3);
+        assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn reader_ending_early_is_an_error() {
+        // The file shrank between reading its size and reading its contents.
+        let bytes = encode(&[&[1.0, 2.0], &[3.0, 4.0]]);
+        let err = parse_from(&bytes[..12], bytes.len() as u64).unwrap_err();
+        assert!(format!("{err:#}").contains("record 1"), "got: {err:#}");
+    }
+
+    #[test]
+    fn reader_reports_shape_before_reading() {
+        let bytes = encode(&[&[1.0, 2.0], &[3.0, 4.0], &[5.0, 6.0]]);
+        let reader = VecsReader::new(&bytes[..], bytes.len() as u64, f32::from_le_bytes).unwrap();
+        assert_eq!(reader.dim(), 2);
+        assert_eq!(reader.len(), 3);
+    }
+
+    #[test]
+    fn reader_yields_each_vector_then_none() {
+        let bytes = encode(&[&[1.0, 2.0], &[3.0, 4.0]]);
+        let mut reader =
+            VecsReader::new(&bytes[..], bytes.len() as u64, f32::from_le_bytes).unwrap();
+        assert_eq!(reader.next_vector().unwrap(), Some(&[1.0, 2.0][..]));
+        assert_eq!(reader.next_vector().unwrap(), Some(&[3.0, 4.0][..]));
+        assert_eq!(reader.next_vector().unwrap(), None);
+        assert_eq!(reader.next_vector().unwrap(), None, "stays exhausted");
+    }
+
+    #[test]
+    fn reader_validates_lazily_but_keeps_earlier_vectors_valid() {
+        // Record 1 has a bad header: record 0 must still come back intact.
+        let mut bytes = encode(&[&[1.0, 2.0]]);
+        bytes.extend(encode(&[&[3.0]]));
+        bytes.extend(0f32.to_le_bytes());
+        let mut reader =
+            VecsReader::new(&bytes[..], bytes.len() as u64, f32::from_le_bytes).unwrap();
+        assert_eq!(reader.next_vector().unwrap(), Some(&[1.0, 2.0][..]));
+        let err = reader.next_vector().unwrap_err();
+        assert!(err.to_string().contains("record 1"), "got: {err}");
+    }
+
+    #[test]
+    fn open_fvecs_streams_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.fvecs");
+        std::fs::write(&path, encode(&[&[1.0], &[2.0], &[3.0]])).unwrap();
+
+        let mut reader = VecsReader::open_fvecs(&path).unwrap();
+        assert_eq!((reader.dim(), reader.len()), (1, 3));
+        let mut seen = Vec::new();
+        while let Some(v) = reader.next_vector().unwrap() {
+            seen.extend_from_slice(v);
+        }
+        assert_eq!(seen, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn open_fvecs_errors_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.fvecs");
+        std::fs::write(&path, []).unwrap();
+        let err = format!("{:#}", VecsReader::open_fvecs(&path).unwrap_err());
+        assert!(err.contains("empty.fvecs"), "got: {err}");
+    }
+
+    #[test]
+    fn single_record() {
+        assert_eq!(parse(&encode(&[&[7.0]])).unwrap(), (1, vec![7.0]));
+    }
+
+    #[test]
+    fn reads_files_larger_than_the_read_buffer() {
+        const DIM: usize = 960; // GIST
+        let records: Vec<Vec<f32>> = (0..300)
+            .map(|r| (0..DIM).map(|i| (r * DIM + i) as f32).collect())
+            .collect();
+        let refs: Vec<&[f32]> = records.iter().map(Vec::as_slice).collect();
+        let bytes = encode(&refs);
+        assert!(
+            bytes.len() > READ_BUFFER,
+            "test must cross a buffer boundary"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gist.fvecs");
+        std::fs::write(&path, bytes).unwrap();
+
+        let v = read_fvecs(&path).unwrap();
+        assert_eq!(v.dim, DIM);
+        assert_eq!(v.len(), 300);
+        assert_eq!(v.data, records.concat());
+    }
+
     #[test]
     fn parses_records() {
         let bytes = encode(&[&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]]);
-        let (dim, data) = parse_vecs(&bytes, f32::from_le_bytes).unwrap();
+        let (dim, data) = parse(&bytes).unwrap();
         assert_eq!(dim, 3);
         assert_eq!(data, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
@@ -133,7 +403,7 @@ mod tests {
     fn rejects_truncated_file() {
         let mut bytes = encode(&[&[1.0, 2.0], &[3.0, 4.0]]);
         bytes.pop();
-        let err = parse_vecs(&bytes, f32::from_le_bytes).unwrap_err();
+        let err = parse(&bytes).unwrap_err();
         assert!(err.to_string().contains("not a multiple"), "got: {err}");
     }
 
@@ -143,18 +413,18 @@ mod tests {
         let mut bytes = encode(&[&[1.0, 2.0]]);
         bytes.extend(encode(&[&[3.0]]));
         bytes.extend(0f32.to_le_bytes());
-        let err = parse_vecs(&bytes, f32::from_le_bytes).unwrap_err();
+        let err = parse(&bytes).unwrap_err();
         assert!(err.to_string().contains("record 1"), "got: {err}");
     }
 
     #[test]
     fn rejects_empty_file() {
-        assert!(parse_vecs(&[], f32::from_le_bytes).is_err());
+        assert!(parse(&[]).is_err());
     }
 
     #[test]
     fn rejects_zero_dimension() {
-        let err = parse_vecs(&0u32.to_le_bytes(), f32::from_le_bytes).unwrap_err();
+        let err = parse(&0u32.to_le_bytes()).unwrap_err();
         assert!(err.to_string().contains("dimension is 0"), "got: {err}");
     }
 
@@ -163,13 +433,13 @@ mod tests {
         // A negative `i32` header reads as a huge `u32`; no file is that big.
         let mut bytes = (-1i32).to_le_bytes().to_vec();
         bytes.extend(1f32.to_le_bytes());
-        assert!(parse_vecs(&bytes, f32::from_le_bytes).is_err());
+        assert!(parse(&bytes).is_err());
     }
 
     #[test]
     fn rejects_header_without_values() {
         let bytes = 3u32.to_le_bytes();
-        assert!(parse_vecs(&bytes, f32::from_le_bytes).is_err());
+        assert!(parse(&bytes).is_err());
     }
 
     #[test]
