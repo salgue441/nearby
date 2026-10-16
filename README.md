@@ -65,8 +65,12 @@ ground truth that approximate indexes are measured against.
 - With the `Cosine` metric, each vector's norm is stored at insert time, so a
   comparison costs one dot product instead of three.
 
-The distance kernels are portable scalar code that keeps 8 independent running
-sums, which lets the compiler vectorize them.
+The distance kernels are picked at runtime. On x86-64 CPUs with AVX2 and FMA
+(Intel since 2013, AMD since 2015), hand-written SIMD kernels compute about
+twice as fast as portable code. Elsewhere, portable code keeps 8 independent
+running sums so the compiler can vectorize it (with NEON on aarch64). The
+kernels round differently, so distances can differ in the last bits between
+CPUs; on any one machine they are deterministic.
 
 ### Approximate search (`Hnsw`)
 
@@ -181,9 +185,11 @@ cargo run -p nearby-bench --release -- data/sift --k 100 --ef 100,200,400
 cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 ```
 
-The distance kernels speed up another ~20% when compiled for your exact CPU
-(AVX2, for example). The resulting binary may not run on other machines, so
-this is set per run rather than committed:
+The SIMD distance kernels are chosen at runtime, so a normal build already
+uses AVX2 where the CPU has it. Compiling for your exact CPU still helps a
+little (5–25% on in-cache distances, ~5% when memory-bound): the runtime
+check disappears and the kernels can be inlined. The resulting binary may
+not run on other machines, so this is set per run rather than committed:
 
 ```sh
 RUSTFLAGS="-C target-cpu=native" cargo run -p nearby-bench --release

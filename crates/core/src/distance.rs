@@ -1,12 +1,28 @@
 //! Distance functions between vectors.
 //!
 //! These are the hottest functions in the whole database: a single search
-//! calls them thousands of times. This version is portable scalar code that
-//! keeps several independent running sums so the compiler can auto-vectorize
-//! it; Milestone 3 adds explicit SIMD versions behind the same functions.
+//! calls them thousands of times.
+//!
+//! [`dot`] and [`l2_squared`] (and everything built on them) pick a kernel at
+//! runtime:
+//!
+//! - **x86-64 with AVX2 and FMA:** hand-written SIMD kernels, about 2x faster.
+//!   The default x86-64 target only guarantees SSE2, so the CPU is checked
+//!   once at runtime instead of requiring a CPU-specific build.
+//! - **Everywhere else:** portable code that keeps several independent
+//!   running sums so the compiler can auto-vectorize it. On aarch64 that
+//!   already uses NEON, which every aarch64 CPU has.
+//!
+//! The kernels round differently, so the same inputs can give results that
+//! differ in the last bits on different CPUs. On any one machine, results
+//! are deterministic.
 //!
 //! All functions expect slices of equal length. That is checked in debug
-//! builds only, because callers validate dimensions at the API boundary.
+//! builds only, because callers validate dimensions at the API boundary;
+//! with mismatched lengths, the extra values of the longer slice are ignored.
+
+#[cfg(target_arch = "x86_64")]
+mod x86;
 
 use crate::types::Metric;
 
@@ -67,16 +83,43 @@ fn sum_lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
 }
 
 /// Dot product: `sum(a[i] * b[i])`.
+///
+/// Uses AVX2 and FMA when the CPU supports them (see the module docs).
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    sum_lanes(a, b, |x, y| x * y)
+    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        // SAFETY: `available` confirmed that this CPU supports AVX2 and FMA.
+        return unsafe { x86::dot(a, b) };
+    }
+    dot_portable(a, b)
 }
 
 /// Squared Euclidean distance: `sum((a[i] - b[i])^2)`.
 ///
 /// Skipping the square root keeps the same ranking and saves time.
+/// Uses AVX2 and FMA when the CPU supports them (see the module docs).
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        // SAFETY: `available` confirmed that this CPU supports AVX2 and FMA.
+        return unsafe { x86::l2_squared(a, b) };
+    }
+    l2_squared_portable(a, b)
+}
+
+/// [`dot`] for CPUs without a SIMD kernel.
+#[inline]
+fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
+    sum_lanes(a, b, |x, y| x * y)
+}
+
+/// [`l2_squared`] for CPUs without a SIMD kernel.
+#[inline]
+fn l2_squared_portable(a: &[f32], b: &[f32]) -> f32 {
     sum_lanes(a, b, |x, y| {
         let d = x - y;
         d * d
@@ -182,21 +225,41 @@ mod tests {
         );
     }
 
+    type Kernel = fn(&[f32], &[f32]) -> f32;
+
+    /// Every (dot, l2) kernel pair this CPU can run, by name. The public
+    /// functions only ever take one path, so each kernel is tested directly.
+    fn kernels() -> Vec<(&'static str, Kernel, Kernel)> {
+        let mut kernels: Vec<(&'static str, Kernel, Kernel)> =
+            vec![("portable", dot_portable, l2_squared_portable)];
+        #[cfg(target_arch = "x86_64")]
+        if x86::available() {
+            // SAFETY (both closures): this CPU supports AVX2 and FMA.
+            kernels.push((
+                "avx2",
+                |a, b| unsafe { x86::dot(a, b) },
+                |a, b| unsafe { x86::l2_squared(a, b) },
+            ));
+        } else {
+            eprintln!("note: this CPU lacks AVX2/FMA; skipping those kernels");
+        }
+        kernels
+    }
+
     #[test]
     fn kernels_match_reference_at_every_length() {
-        for n in lengths() {
-            let a = pseudo_random(n, 1 + n as u64);
-            let b = pseudo_random(n, 1_000 + n as u64);
-            assert_close(
-                dot(&a, &b),
-                reference(&a, &b, |x, y| x * y),
-                &format!("dot n={n}"),
-            );
-            assert_close(
-                l2_squared(&a, &b),
-                reference(&a, &b, |x, y| (x - y) * (x - y)),
-                &format!("l2 n={n}"),
-            );
+        for (name, dot, l2) in kernels() {
+            for n in lengths() {
+                let a = pseudo_random(n, 1 + n as u64);
+                let b = pseudo_random(n, 1_000 + n as u64);
+                let what = format!("{name} n={n}");
+                assert_close(dot(&a, &b), reference(&a, &b, |x, y| x * y), &what);
+                assert_close(
+                    l2(&a, &b),
+                    reference(&a, &b, |x, y| (x - y) * (x - y)),
+                    &what,
+                );
+            }
         }
     }
 
@@ -204,13 +267,71 @@ mod tests {
     fn kernels_are_exact_on_small_integers() {
         // Small integer sums are exact in any order, so this catches a
         // dropped, doubled or misaligned element exactly.
-        for n in lengths() {
-            let a: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
-            let b: Vec<f32> = (0..n).map(|i| (i * 3 % 5) as f32 - 2.0).collect();
-            let dot_expected: f32 = (0..n).map(|i| a[i] * b[i]).sum();
-            let l2_expected: f32 = (0..n).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum();
-            assert_eq!(dot(&a, &b), dot_expected, "dot n={n}");
-            assert_eq!(l2_squared(&a, &b), l2_expected, "l2 n={n}");
+        for (name, dot, l2) in kernels() {
+            for n in lengths() {
+                let a: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+                let b: Vec<f32> = (0..n).map(|i| (i * 3 % 5) as f32 - 2.0).collect();
+                let dot_expected: f32 = (0..n).map(|i| a[i] * b[i]).sum();
+                let l2_expected: f32 = (0..n).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum();
+                assert_eq!(dot(&a, &b), dot_expected, "{name} dot n={n}");
+                assert_eq!(l2(&a, &b), l2_expected, "{name} l2 n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn kernels_handle_unaligned_slices() {
+        // Vectors live at arbitrary offsets inside an index's buffer.
+        let a = pseudo_random(200, 11);
+        let b = pseudo_random(200, 12);
+        for (name, dot, l2) in kernels() {
+            for offset in 0..8 {
+                for n in [31, 128, 129] {
+                    let (x, y) = (&a[offset..offset + n], &b[offset + 3..offset + 3 + n]);
+                    let what = format!("{name} offset={offset} n={n}");
+                    assert_close(dot(x, y), reference(x, y, |p, q| p * q), &what);
+                    assert_close(l2(x, y), reference(x, y, |p, q| (p - q) * (p - q)), &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_functions_use_the_fastest_available_kernel() {
+        let (name, fastest_dot, fastest_l2) = *kernels().last().unwrap();
+        let a = pseudo_random(128, 21);
+        let b = pseudo_random(128, 22);
+        assert_eq!(
+            dot(&a, &b).to_bits(),
+            fastest_dot(&a, &b).to_bits(),
+            "{name}"
+        );
+        assert_eq!(
+            l2_squared(&a, &b).to_bits(),
+            fastest_l2(&a, &b).to_bits(),
+            "{name}"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn simd_kernels_never_read_past_the_shorter_slice() {
+        if !x86::available() {
+            eprintln!("note: this CPU lacks AVX2/FMA; skipping");
+            return;
+        }
+        // Lengths that exercise every loop: 32-wide blocks, 8-wide chunks
+        // and the scalar tail. Only the shared prefix may be read.
+        let long = vec![1.0; 75];
+        for short_len in [0, 5, 8, 37, 74] {
+            let short = vec![2.0; short_len];
+            let expected = 2.0 * short_len as f32;
+            // SAFETY: this CPU supports AVX2 and FMA.
+            unsafe {
+                assert_eq!(x86::dot(&long, &short), expected, "len {short_len}");
+                assert_eq!(x86::dot(&short, &long), expected, "len {short_len}");
+                assert_eq!(x86::l2_squared(&long, &short), short_len as f32);
+            }
         }
     }
 
