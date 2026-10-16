@@ -1,8 +1,9 @@
 //! Distance functions between vectors.
 //!
 //! These are the hottest functions in the whole database: a single search
-//! calls them thousands of times. This first version is plain scalar code;
-//! Milestone 3 adds SIMD versions behind the same functions.
+//! calls them thousands of times. This version is portable scalar code that
+//! keeps several independent running sums so the compiler can auto-vectorize
+//! it; Milestone 3 adds explicit SIMD versions behind the same functions.
 //!
 //! All functions expect slices of equal length. That is checked in debug
 //! builds only, because callers validate dimensions at the API boundary.
@@ -33,11 +34,42 @@ impl Metric {
     }
 }
 
+/// Number of independent running sums in [`sum_lanes`].
+///
+/// 8 `f32`s fill one AVX register, or two SSE registers.
+const LANES: usize = 8;
+
+/// `sum(term(a[i], b[i]))`, written so the compiler can vectorize it.
+///
+/// Float addition is not associative, so LLVM may not reorder a plain
+/// `.iter().sum()` into SIMD lanes: every addition waits for the previous
+/// one. Keeping `LANES` independent sums makes that reordering explicit,
+/// which lets it vectorize (about 3x faster on 128-d vectors).
+///
+/// The summation order differs from a left-to-right sum, so results can
+/// differ from it in the last bits.
+#[inline]
+fn sum_lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
+
+    let (a_chunks, a_tail) = a.as_chunks::<LANES>();
+    let (b_chunks, b_tail) = b.as_chunks::<LANES>();
+
+    let mut acc = [0.0f32; LANES];
+    for (x, y) in a_chunks.iter().zip(b_chunks) {
+        for i in 0..LANES {
+            acc[i] += term(x[i], y[i]);
+        }
+    }
+
+    let tail: f32 = a_tail.iter().zip(b_tail).map(|(&x, &y)| term(x, y)).sum();
+    acc.iter().sum::<f32>() + tail
+}
+
 /// Dot product: `sum(a[i] * b[i])`.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    sum_lanes(a, b, |x, y| x * y)
 }
 
 /// Squared Euclidean distance: `sum((a[i] - b[i])^2)`.
@@ -45,14 +77,10 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// Skipping the square root keeps the same ranking and saves time.
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    sum_lanes(a, b, |x, y| {
+        let d = x - y;
+        d * d
+    })
 }
 
 /// Euclidean length of `v`.
@@ -104,6 +132,74 @@ mod tests {
 
     fn approx_eq(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    /// Lengths around the lane width (empty, tail only, exact chunks, chunks
+    /// plus tail) and real dataset dimensions (SIFT 128, GIST 960).
+    fn lengths() -> impl Iterator<Item = usize> {
+        (0..=40).chain([127, 128, 129, 960])
+    }
+
+    /// Tiny deterministic pseudo-random generator in `[-1, 1)`.
+    fn pseudo_random(n: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    }
+
+    /// Left-to-right reference sum in `f64`, plus the sum of `|term|`, which
+    /// bounds the rounding error of any `f32` summation order.
+    fn reference(a: &[f32], b: &[f32], term: impl Fn(f64, f64) -> f64) -> (f64, f64) {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| term(f64::from(x), f64::from(y)))
+            .fold((0.0, 0.0), |(sum, abs), t| (sum + t, abs + t.abs()))
+    }
+
+    fn assert_close(got: f32, (expected, scale): (f64, f64), what: &str) {
+        let tolerance = 1e-5 * scale + 1e-6;
+        assert!(
+            (f64::from(got) - expected).abs() <= tolerance,
+            "{what}: got {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn kernels_match_reference_at_every_length() {
+        for n in lengths() {
+            let a = pseudo_random(n, 1 + n as u64);
+            let b = pseudo_random(n, 1_000 + n as u64);
+            assert_close(
+                dot(&a, &b),
+                reference(&a, &b, |x, y| x * y),
+                &format!("dot n={n}"),
+            );
+            assert_close(
+                l2_squared(&a, &b),
+                reference(&a, &b, |x, y| (x - y) * (x - y)),
+                &format!("l2 n={n}"),
+            );
+        }
+    }
+
+    #[test]
+    fn kernels_are_exact_on_small_integers() {
+        // Small integer sums are exact in any order, so this catches a
+        // dropped, doubled or misaligned element exactly.
+        for n in lengths() {
+            let a: Vec<f32> = (0..n).map(|i| (i % 7) as f32).collect();
+            let b: Vec<f32> = (0..n).map(|i| (i * 3 % 5) as f32 - 2.0).collect();
+            let dot_expected: f32 = (0..n).map(|i| a[i] * b[i]).sum();
+            let l2_expected: f32 = (0..n).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum();
+            assert_eq!(dot(&a, &b), dot_expected, "dot n={n}");
+            assert_eq!(l2_squared(&a, &b), l2_expected, "l2 n={n}");
+        }
     }
 
     #[test]
