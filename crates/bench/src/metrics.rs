@@ -6,17 +6,20 @@ use std::time::Duration;
 /// Fraction of the true `k` nearest neighbors that appear in the first `k` results.
 ///
 /// `truth` is the ground-truth id list for one query, closest first.
-/// 1.0 means every true neighbor was found.
+/// 1.0 means every true neighbor was found. Each true neighbor counts once,
+/// even if it appears several times in `results`.
 pub fn recall_at_k(results: &[ScoredPoint], truth: &[u32], k: usize) -> f64 {
     let truth = &truth[..k.min(truth.len())];
     if truth.is_empty() {
         return 1.0;
     }
 
-    let found = results
+    // Count from the truth side, so duplicate results can't be counted twice.
+    // O(k^2), which is negligible for the k values benchmarks use.
+    let top: Vec<PointId> = results.iter().take(k).map(|p| p.id).collect();
+    let found = truth
         .iter()
-        .take(k)
-        .filter(|p| truth.iter().any(|&t| PointId::from(t) == p.id))
+        .filter(|&&t| top.contains(&PointId::from(t)))
         .count();
 
     found as f64 / truth.len() as f64
@@ -111,6 +114,12 @@ mod tests {
     fn only_first_k_results_count() {
         let r = recall_at_k(&points(&[9, 1]), &[1, 2], 1);
         assert!(r.abs() < 1e-9, "id 1 is outside the first k = 1 results");
+    }
+
+    #[test]
+    fn duplicate_results_count_once() {
+        let r = recall_at_k(&points(&[1, 1]), &[1, 2], 2);
+        assert!((r - 0.5).abs() < 1e-9, "got {r}");
     }
 
     #[test]
