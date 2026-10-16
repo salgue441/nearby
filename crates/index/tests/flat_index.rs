@@ -107,6 +107,16 @@ fn with_capacity_panics_on_zero_dimension() {
 }
 
 #[test]
+fn huge_k_returns_everything_sorted() {
+    let mut index = FlatIndex::new(1, Metric::L2);
+    for id in [4, 0, 3, 1, 2] {
+        index.add(id, &[id as f32]).unwrap();
+    }
+    let results = index.search(&[0.0], usize::MAX).unwrap();
+    assert_eq!(ids(&results), vec![0, 1, 2, 3, 4]);
+}
+
+#[test]
 fn k_zero_returns_nothing() {
     let mut index = FlatIndex::new(1, Metric::L2);
     index.add(1, &[1.0]).unwrap();

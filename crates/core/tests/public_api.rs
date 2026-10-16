@@ -228,6 +228,18 @@ fn new_topk_is_empty() {
 }
 
 #[test]
+fn huge_k_does_not_allocate_up_front() {
+    // Reserving `k` entries eagerly would panic ("capacity overflow") or abort.
+    let mut top = TopK::new(usize::MAX);
+    assert_eq!(top.k(), usize::MAX);
+    for id in 0..2_000 {
+        assert!(top.push(id, id as f32), "never full, so every push is kept");
+    }
+    assert_eq!(top.len(), 2_000);
+    assert!(!top.is_full());
+}
+
+#[test]
 fn len_never_exceeds_k() {
     let mut top = TopK::new(3);
     for (id, d) in pseudo_random(100, 5).into_iter().enumerate() {

@@ -77,14 +77,19 @@ pub struct TopK {
 }
 
 impl TopK {
+    /// Entries reserved up front. Past this the heap grows on demand, so a
+    /// huge `k` (from an untrusted request, say) only costs memory for the
+    /// candidates actually kept, instead of failing a giant allocation.
+    const MAX_PREALLOC: usize = 1024;
+
     /// Creates an empty collector that keeps at most `k` candidates.
     ///
-    /// Memory for `k` entries is reserved up front. With `k == 0`, every
-    /// candidate is rejected.
+    /// Memory for up to 1024 entries is reserved up front; any `k` is safe,
+    /// including `usize::MAX`. With `k == 0`, every candidate is rejected.
     pub fn new(k: usize) -> Self {
         Self {
             k,
-            heap: BinaryHeap::with_capacity(k),
+            heap: BinaryHeap::with_capacity(k.min(Self::MAX_PREALLOC)),
         }
     }
 
