@@ -393,4 +393,149 @@ mod tests {
             assert!(index.graph.neighbors(node, 0).len() <= index.params.m0);
         }
     }
+
+    /// `n` deterministic pseudo-random vectors in `[0, 1)^dim`.
+    fn random_index(n: usize, dim: usize, params: HnswParams) -> Hnsw {
+        let mut rng = SplitMix64::new(99);
+        let mut index = Hnsw::new(dim, Metric::L2, params).unwrap();
+        for id in 0..n {
+            let v: Vec<f32> = (0..dim).map(|_| rng.next_f64() as f32).collect();
+            index.insert(id as PointId, &v).unwrap();
+        }
+        index
+    }
+
+    /// Checks every structural invariant the search relies on.
+    fn assert_graph_invariants(index: &Hnsw) {
+        let n = index.len() as u32;
+        let mut top = 0;
+        for node in 0..n {
+            let level = index.graph.level(node);
+            top = top.max(level);
+            for l in 0..=level {
+                let links = index.graph.neighbors(node, l);
+                assert!(
+                    links.len() <= index.params.max_links(l),
+                    "node {node} has {} links on layer {l}",
+                    links.len()
+                );
+                let mut seen = std::collections::HashSet::new();
+                for &next in links {
+                    assert_ne!(next, node, "node {node} links to itself on layer {l}");
+                    assert!(next < n, "node {node} links to missing node {next}");
+                    assert!(seen.insert(next), "node {node} links to {next} twice");
+                    assert!(
+                        index.graph.level(next) >= l,
+                        "node {node} links to {next}, which is not on layer {l}"
+                    );
+                }
+            }
+        }
+        assert_eq!(index.max_level, top, "max_level is the highest node level");
+        let entry = index
+            .entry_point
+            .expect("non-empty index has an entry point");
+        assert_eq!(
+            index.graph.level(entry),
+            top,
+            "entry point is on the top layer"
+        );
+    }
+
+    #[test]
+    fn graph_invariants_hold_after_many_inserts() {
+        let index = random_index(1_000, 8, HnswParams::with_m(6));
+        assert!(
+            index.max_level() > 0,
+            "1000 nodes with m = 6 use upper layers"
+        );
+        assert_graph_invariants(&index);
+    }
+
+    #[test]
+    fn every_node_is_reachable_on_layer_0() {
+        // Search only works if layer 0 is connected from the entry point.
+        let index = random_index(1_000, 8, HnswParams::with_m(6));
+        let mut seen = vec![false; index.len()];
+        let mut stack = vec![index.entry_point.unwrap()];
+        seen[stack[0] as usize] = true;
+        while let Some(node) = stack.pop() {
+            for &next in index.graph.neighbors(node, 0) {
+                if !std::mem::replace(&mut seen[next as usize], true) {
+                    stack.push(next);
+                }
+            }
+        }
+        let unreachable = seen.iter().filter(|&&s| !s).count();
+        assert_eq!(unreachable, 0, "{unreachable} nodes unreachable on layer 0");
+    }
+
+    #[test]
+    fn first_insert_becomes_the_entry_point() {
+        let mut index = Hnsw::new(1, Metric::L2, HnswParams::default()).unwrap();
+        assert_eq!(index.entry_point, None);
+        index.insert(7, &[1.0]).unwrap();
+        assert_eq!(index.entry_point, Some(0));
+        assert_eq!(index.max_level, index.graph.level(0));
+    }
+
+    #[test]
+    fn k_zero_and_k_beyond_len() {
+        let index = grid_index();
+        assert!(index.search(&[1.0, 1.0], 0).unwrap().is_empty(), "k = 0");
+        let all = index.search(&[1.0, 1.0], 1_000).unwrap();
+        assert_eq!(all.len(), 100, "a connected graph reaches every node");
+    }
+
+    #[test]
+    fn set_ef_search_updates_params_and_clamps_zero() {
+        let mut index = grid_index();
+        index.set_ef_search(123);
+        assert_eq!(index.params().ef_search, 123);
+        index.set_ef_search(0);
+        assert_eq!(index.params().ef_search, 1);
+    }
+
+    #[test]
+    fn accessors_report_construction_values() {
+        let index = Hnsw::new(3, Metric::Cosine, HnswParams::with_m(8)).unwrap();
+        assert_eq!(index.metric(), Metric::Cosine);
+        assert_eq!(index.params(), &HnswParams::with_m(8));
+        assert_eq!(index.dim(), 3);
+        assert_eq!(index.max_level(), 0);
+    }
+
+    #[test]
+    fn rejected_vectors_leave_the_index_unchanged() {
+        let mut index = grid_index();
+        let before = (index.len(), index.entry_point, index.max_level);
+        assert!(matches!(
+            index.insert(1_000, &[f32::NAN, 0.0]),
+            Err(Error::InvalidVector)
+        ));
+        assert_eq!((index.len(), index.entry_point, index.max_level), before);
+        assert_graph_invariants(&index);
+    }
+
+    #[test]
+    fn searches_return_their_visited_set_to_the_pool() {
+        let index = grid_index();
+        index.search(&[1.0, 1.0], 5).unwrap();
+        index.search(&[2.0, 2.0], 5).unwrap();
+        let pooled = index.visited_pool.lock().unwrap().len();
+        assert_eq!(pooled, 1, "sequential searches reuse one visited set");
+    }
+
+    #[test]
+    fn random_levels_follow_the_expected_distribution() {
+        // P(level >= 1) = 1/m. With m = 16 and 20k draws, expect ~1250.
+        let mut index = Hnsw::new(1, Metric::L2, HnswParams::with_m(16)).unwrap();
+        let draws = 20_000;
+        let upper = (0..draws).filter(|_| index.random_level() >= 1).count();
+        let expected = draws / 16;
+        assert!(
+            upper.abs_diff(expected) < expected / 5,
+            "{upper} of {draws} draws reached layer 1, expected about {expected}"
+        );
+    }
 }

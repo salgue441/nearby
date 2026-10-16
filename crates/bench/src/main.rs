@@ -218,3 +218,121 @@ fn parse_number(s: &str) -> anyhow::Result<usize> {
         .parse()
         .with_context(|| format!("`{s}` is not a positive integer"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataset::Vectors;
+
+    fn parse(args: &[&str]) -> anyhow::Result<Option<Args>> {
+        parse_args(args.iter().map(|&s| s.to_owned()))
+    }
+
+    #[test]
+    fn defaults() {
+        let args = parse(&[]).unwrap().unwrap();
+        assert_eq!(
+            args,
+            Args {
+                dir: PathBuf::from("data/siftsmall"),
+                index: IndexChoice::Both,
+                k: 10,
+                m: 16,
+                ef_construction: 200,
+                ef_search: vec![10, 20, 40, 80, 160, 320],
+            }
+        );
+    }
+
+    #[test]
+    fn every_option() {
+        let args = parse(&[
+            "data/sift",
+            "--index",
+            "hnsw",
+            "--k",
+            "100",
+            "--m",
+            "32",
+            "--ef-construction",
+            "400",
+            "--ef",
+            "50, 100,200",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(args.dir, PathBuf::from("data/sift"));
+        assert_eq!(args.index, IndexChoice::Hnsw);
+        assert_eq!((args.k, args.m, args.ef_construction), (100, 32, 400));
+        assert_eq!(args.ef_search, vec![50, 100, 200]);
+    }
+
+    #[test]
+    fn options_may_come_before_the_directory() {
+        let args = parse(&["--index", "flat", "data/gist"]).unwrap().unwrap();
+        assert_eq!(args.dir, PathBuf::from("data/gist"));
+        assert_eq!(args.index, IndexChoice::Flat);
+    }
+
+    #[test]
+    fn help_returns_none() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+        assert!(parse(&["data/sift", "-h"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn errors_explain_the_problem() {
+        let cases: [(&[&str], &str); 7] = [
+            (&["--index", "ivf"], "unknown index `ivf`"),
+            (&["--frobnicate"], "unknown option `--frobnicate`"),
+            (&["--k"], "--k needs a value"),
+            (&["--k", "ten"], "`ten` is not"),
+            (&["--k", "-3"], "`-3` is not"),
+            (&["--k", "0"], "--k must be at least 1"),
+            (&["--ef", "10,,20"], "`` is not"),
+        ];
+        for (args, expected) in cases {
+            let err = format!("{:#}", parse(args).unwrap_err());
+            assert!(err.contains(expected), "{args:?}: got {err}");
+        }
+    }
+
+    #[test]
+    fn usage_is_included_in_option_errors() {
+        let err = format!("{:#}", parse(&["--bogus"]).unwrap_err());
+        assert!(err.contains("usage: nearby-bench"), "got: {err}");
+    }
+
+    #[test]
+    fn run_queries_on_an_exact_index_has_perfect_recall() {
+        let base = Vectors {
+            dim: 1,
+            data: vec![0.0, 10.0, 20.0, 30.0],
+        };
+        let data = Dataset {
+            name: "line".to_owned(),
+            queries: Vectors {
+                dim: 1,
+                data: vec![1.0, 29.0],
+            },
+            truth: vec![vec![0, 1], vec![3, 2]],
+            base,
+        };
+        let mut flat = FlatIndex::new(1, Metric::L2);
+        for (i, v) in data.base.iter().enumerate() {
+            flat.add(i as PointId, v).unwrap();
+        }
+
+        let (recall, stats) = run_queries(&flat, &data, 2).unwrap();
+        assert!((recall - 1.0).abs() < 1e-9);
+        assert_eq!(stats.count, 2);
+    }
+
+    #[test]
+    fn fmt_duration_uses_two_decimals() {
+        assert_eq!(
+            fmt_duration(std::time::Duration::from_micros(1_500)),
+            "1.50ms"
+        );
+    }
+}

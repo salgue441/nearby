@@ -52,4 +52,28 @@ mod tests {
             assert!(x > 0.0 && x <= 1.0, "{x}");
         }
     }
+
+    #[test]
+    fn matches_the_reference_implementation() {
+        // First outputs for seed 0 from the reference SplitMix64.
+        let mut rng = SplitMix64::new(0);
+        assert_eq!(rng.next_u64(), 0xE220_A839_7B1D_CDAF);
+        assert_eq!(rng.next_u64(), 0x6E78_9E6A_A1B9_65F4);
+        assert_eq!(rng.next_u64(), 0x06C4_5D18_8009_454F);
+    }
+
+    #[test]
+    fn different_seeds_diverge() {
+        let mut a = SplitMix64::new(1);
+        let mut b = SplitMix64::new(2);
+        assert_ne!(a.next_u64(), b.next_u64());
+    }
+
+    #[test]
+    fn floats_are_roughly_uniform() {
+        let mut rng = SplitMix64::new(3);
+        let n = 100_000;
+        let mean = (0..n).map(|_| rng.next_f64()).sum::<f64>() / f64::from(n);
+        assert!((mean - 0.5).abs() < 0.01, "mean {mean}");
+    }
 }

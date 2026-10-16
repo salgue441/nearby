@@ -110,4 +110,46 @@ mod tests {
         g.add_node(0);
         g.set_neighbors(0, 0, &[1, 2, 3]);
     }
+
+    #[test]
+    fn nodes_get_sequential_ids_and_their_own_levels() {
+        let mut g = Graph::with_capacity(4, 0);
+        g.add_node(0);
+        g.add_node(3);
+        g.add_node(1);
+        assert_eq!((g.level(0), g.level(1), g.level(2)), (0, 3, 1));
+    }
+
+    #[test]
+    fn layer0_slots_do_not_overlap() {
+        let mut g = Graph::with_capacity(3, 0);
+        for _ in 0..3 {
+            g.add_node(0);
+        }
+        g.set_neighbors(0, 0, &[1, 2]);
+        g.set_neighbors(1, 0, &[0, 2, 2]);
+        g.set_neighbors(2, 0, &[0]);
+        assert_eq!(g.neighbors(0, 0), &[1, 2]);
+        assert_eq!(g.neighbors(1, 0), &[0, 2, 2]);
+        assert_eq!(g.neighbors(2, 0), &[0]);
+    }
+
+    #[test]
+    fn upper_layers_are_independent() {
+        let mut g = Graph::with_capacity(2, 0);
+        g.add_node(3);
+        g.set_neighbors(0, 1, &[1]);
+        g.set_neighbors(0, 3, &[2, 3]);
+        assert_eq!(g.neighbors(0, 1), &[1]);
+        assert!(g.neighbors(0, 2).is_empty(), "layer 2 was never set");
+        assert_eq!(g.neighbors(0, 3), &[2, 3]);
+    }
+
+    #[test]
+    fn layer0_list_may_fill_every_slot() {
+        let mut g = Graph::with_capacity(3, 0);
+        g.add_node(0);
+        g.set_neighbors(0, 0, &[1, 2, 3]);
+        assert_eq!(g.neighbors(0, 0), &[1, 2, 3]);
+    }
 }

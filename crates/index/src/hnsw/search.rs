@@ -185,4 +185,87 @@ mod tests {
         let nodes: Vec<u32> = selected.iter().map(|n| n.node).collect();
         assert_eq!(nodes, vec![0, 2]);
     }
+
+    /// Five points on a line, each linked to its neighbors: 0 - 1 - 2 - 3 - 4.
+    fn line() -> (VectorStore, Graph) {
+        let store = store(&[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]);
+        let mut graph = Graph::with_capacity(2, 5);
+        for _ in 0..5 {
+            graph.add_node(0);
+        }
+        graph.set_neighbors(0, 0, &[1]);
+        graph.set_neighbors(1, 0, &[0, 2]);
+        graph.set_neighbors(2, 0, &[1, 3]);
+        graph.set_neighbors(3, 0, &[2, 4]);
+        graph.set_neighbors(4, 0, &[3]);
+        (store, graph)
+    }
+
+    fn ctx<'a>(store: &'a VectorStore, graph: &'a Graph) -> SearchCtx<'a> {
+        SearchCtx {
+            store,
+            graph,
+            metric: Metric::L2,
+        }
+    }
+
+    fn nodes(found: &[Neighbor]) -> Vec<u32> {
+        found.iter().map(|n| n.node).collect()
+    }
+
+    #[test]
+    fn search_layer_returns_at_most_ef_sorted() {
+        let (store, graph) = line();
+        let ctx = ctx(&store, &graph);
+        let mut visited = VisitedSet::default();
+        let query = [2.2, 0.0];
+        let start = ctx.neighbor(&query, 0);
+
+        let found = ctx.search_layer(&query, &[start], 10, 0, &mut visited);
+        assert_eq!(
+            nodes(&found),
+            vec![2, 3, 1, 4, 0],
+            "all 5 reachable, sorted"
+        );
+        assert!(found.windows(2).all(|w| w[0].distance <= w[1].distance));
+    }
+
+    #[test]
+    fn search_layer_only_reaches_connected_nodes() {
+        let (store, mut graph) = line();
+        graph.set_neighbors(2, 0, &[1]); // cut the 2 -> 3 edge
+        let ctx = ctx(&store, &graph);
+        let mut visited = VisitedSet::default();
+        let query = [4.0, 0.0];
+        let start = ctx.neighbor(&query, 0);
+
+        let found = ctx.search_layer(&query, &[start], 10, 0, &mut visited);
+        assert_eq!(nodes(&found), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn search_layer_accepts_several_entry_points() {
+        let (store, graph) = line();
+        let ctx = ctx(&store, &graph);
+        let mut visited = VisitedSet::default();
+        let query = [0.0, 0.0];
+        let entries = [ctx.neighbor(&query, 4), ctx.neighbor(&query, 1)];
+
+        let found = ctx.search_layer(&query, &entries, 2, 0, &mut visited);
+        assert_eq!(nodes(&found), vec![0, 1]);
+    }
+
+    #[test]
+    fn select_neighbors_edge_cases() {
+        let (store, graph) = line();
+        let ctx = ctx(&store, &graph);
+        let origin = [0.0, 0.0];
+        let candidates: Vec<Neighbor> = (1..5).map(|n| ctx.neighbor(&origin, n)).collect();
+
+        assert!(ctx.select_neighbors(&candidates, 0).is_empty(), "m = 0");
+        assert!(ctx.select_neighbors(&[], 3).is_empty(), "no candidates");
+        // All candidates lie in one direction: each is closer to the previous
+        // one than to the origin, so only the nearest is kept.
+        assert_eq!(nodes(&ctx.select_neighbors(&candidates, 4)), vec![1]);
+    }
 }

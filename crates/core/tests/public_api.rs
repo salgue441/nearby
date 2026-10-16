@@ -141,6 +141,10 @@ fn error_messages() {
         ),
         (Error::PointNotFound(42), "point `42` not found"),
         (
+            Error::InvalidParameter("m must be at least 2".to_owned()),
+            "invalid parameter: m must be at least 2",
+        ),
+        (
             Error::CollectionNotFound("docs".to_owned()),
             "collection `docs` not found",
         ),

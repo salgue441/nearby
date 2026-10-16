@@ -109,4 +109,56 @@ mod tests {
         };
         assert!(p.validate().is_err());
     }
+
+    #[test]
+    fn m0_bounds() {
+        let at = |m0| HnswParams {
+            m0,
+            ..HnswParams::default()
+        };
+        assert!(at(16).validate().is_ok(), "m0 == m is allowed");
+        assert!(at(MAX_M0).validate().is_ok());
+        assert!(
+            at(MAX_M0 + 1).validate().is_err(),
+            "m0 must fit layer-0 slots"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_ef_construction() {
+        let p = HnswParams {
+            ef_construction: 0,
+            ..HnswParams::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn errors_are_invalid_parameter_and_name_the_value() {
+        let err = HnswParams::with_m(1).validate().unwrap_err();
+        assert!(matches!(&err, Error::InvalidParameter(_)), "{err:?}");
+        assert!(err.to_string().contains("got 1"), "{err}");
+    }
+
+    #[test]
+    fn with_m_doubles_m0_and_keeps_other_defaults() {
+        let p = HnswParams::with_m(8);
+        assert_eq!((p.m, p.m0), (8, 16));
+        assert_eq!(p.ef_construction, HnswParams::default().ef_construction);
+        assert_eq!(p.seed, HnswParams::default().seed);
+    }
+
+    #[test]
+    fn max_links_per_layer() {
+        let p = HnswParams::default();
+        assert_eq!(p.max_links(0), p.m0);
+        assert_eq!(p.max_links(1), p.m);
+        assert_eq!(p.max_links(5), p.m);
+    }
+
+    #[test]
+    fn level_multiplier_is_inverse_ln_m() {
+        let p = HnswParams::with_m(16);
+        assert!((p.level_multiplier() - 1.0 / 16f64.ln()).abs() < 1e-12);
+    }
 }

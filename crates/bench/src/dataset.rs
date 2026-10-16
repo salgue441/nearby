@@ -557,4 +557,76 @@ mod tests {
         let err = format!("{:#}", read_ivecs(&corrupt).unwrap_err());
         assert!(err.contains("corrupt.ivecs"), "got: {err}");
     }
+
+    /// Writes a TEXMEX-layout dataset named `name` under `root` and returns
+    /// its directory.
+    fn write_dataset(
+        root: &Path,
+        name: &str,
+        base: &[&[f32]],
+        queries: &[&[f32]],
+        truth: &[&[u32]],
+    ) -> std::path::PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}_base.fvecs")), encode(base)).unwrap();
+        std::fs::write(dir.join(format!("{name}_query.fvecs")), encode(queries)).unwrap();
+        let mut ivecs = Vec::new();
+        for row in truth {
+            ivecs.extend((row.len() as u32).to_le_bytes());
+            for id in *row {
+                ivecs.extend(id.to_le_bytes());
+            }
+        }
+        std::fs::write(dir.join(format!("{name}_groundtruth.ivecs")), ivecs).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dataset_loads_all_three_files() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = write_dataset(
+            root.path(),
+            "tiny",
+            &[&[0.0, 0.0], &[1.0, 1.0], &[2.0, 2.0]],
+            &[&[0.1, 0.1]],
+            &[&[0, 1, 2]],
+        );
+
+        let data = Dataset::load(&dir, 3).unwrap();
+        assert_eq!(data.name, "tiny");
+        assert_eq!((data.base.len(), data.base.dim), (3, 2));
+        assert_eq!(data.queries.len(), 1);
+        assert_eq!(data.truth, vec![vec![0, 1, 2]]);
+    }
+
+    #[test]
+    fn dataset_rejects_inconsistent_files() {
+        let root = tempfile::tempdir().unwrap();
+        let base: &[&[f32]] = &[&[0.0, 0.0], &[1.0, 1.0]];
+
+        let dir = write_dataset(root.path(), "dims", base, &[&[0.0]], &[&[0, 1]]);
+        let err = format!("{:#}", Dataset::load(&dir, 1).unwrap_err());
+        assert!(err.contains("queries have dimension 1"), "got: {err}");
+
+        let dir = write_dataset(root.path(), "rows", base, &[&[0.0, 0.0]], &[&[0], &[1]]);
+        let err = format!("{:#}", Dataset::load(&dir, 1).unwrap_err());
+        assert!(
+            err.contains("2 ground-truth rows for 1 queries"),
+            "got: {err}"
+        );
+
+        let dir = write_dataset(root.path(), "short", base, &[&[0.0, 0.0]], &[&[0, 1]]);
+        let err = format!("{:#}", Dataset::load(&dir, 5).unwrap_err());
+        assert!(err.contains("fewer than k = 5"), "got: {err}");
+    }
+
+    #[test]
+    fn dataset_errors_name_the_missing_file() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("absent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = format!("{:#}", Dataset::load(&dir, 1).unwrap_err());
+        assert!(err.contains("absent_base.fvecs"), "got: {err}");
+    }
 }
