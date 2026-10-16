@@ -21,7 +21,7 @@ pub enum Error {
     #[error("point `{0}` not found")]
     PointNotFound(u64),
 
-    #[error("collection `{0}` already exists")]
+    #[error("collection `{0}` not found")]
     CollectionNotFound(String),
 
     #[error("corrupted data in {}: {reason}", path.display())]
