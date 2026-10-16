@@ -75,6 +75,41 @@ fn results_are_sorted_and_carry_correct_distances() {
 }
 
 #[test]
+fn cosine_distances_are_bit_identical_to_the_metric() {
+    // The index uses stored norms; the result must not change because of it.
+    const DIM: usize = 13; // not a multiple of the kernel's lane width
+    let data = pseudo_random(200 * DIM, 4);
+    let mut index = FlatIndex::new(DIM, Metric::Cosine);
+    for (i, v) in data.as_chunks::<DIM>().0.iter().enumerate() {
+        index.add(i as PointId, v).unwrap();
+    }
+
+    let query = pseudo_random(DIM, 5);
+    for p in index.search(&query, 200).unwrap() {
+        let expected = Metric::Cosine.distance(&query, index.get(p.id).unwrap());
+        assert_eq!(p.distance.to_bits(), expected.to_bits(), "id {}", p.id);
+    }
+}
+
+#[test]
+fn cosine_handles_zero_vectors() {
+    let mut index = FlatIndex::new(2, Metric::Cosine);
+    index.add(1, &[0.0, 0.0]).unwrap();
+    index.add(2, &[1.0, 0.0]).unwrap();
+    index.add(3, &[-1.0, 0.0]).unwrap();
+
+    let results = index.search(&[2.0, 0.0], 3).unwrap();
+    assert_eq!(ids(&results), vec![2, 1, 3]);
+    assert!(
+        (results[1].distance - 1.0).abs() < 1e-6,
+        "zero vector is orthogonal"
+    );
+
+    let from_zero = index.search(&[0.0, 0.0], 3).unwrap();
+    assert!(from_zero.iter().all(|p| (p.distance - 1.0).abs() < 1e-6));
+}
+
+#[test]
 fn reports_dim_and_len() {
     let mut index = FlatIndex::new(4, Metric::Cosine);
     assert_eq!(index.dim(), 4);

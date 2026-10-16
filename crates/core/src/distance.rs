@@ -95,7 +95,19 @@ pub fn norm(v: &[f32]) -> f32 {
 /// orthogonal to everything and gets distance `1.0`.
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    let denom = norm(a) * norm(b);
+    cosine_distance_with_norms(a, b, norm(a), norm(b))
+}
+
+/// [`cosine_distance`] with the norms already known, so a comparison costs
+/// one dot product instead of three.
+///
+/// Indexes store each vector's norm once at insert time and compute the
+/// query's norm once per search. `norm_a` and `norm_b` must be
+/// [`norm`]`(a)` and [`norm`]`(b)`; given those, the result is bit-for-bit
+/// the same as [`cosine_distance`].
+#[inline]
+pub fn cosine_distance_with_norms(a: &[f32], b: &[f32], norm_a: f32, norm_b: f32) -> f32 {
+    let denom = norm_a * norm_b;
     if denom <= f32::MIN_POSITIVE {
         return 1.0;
     }
@@ -200,6 +212,26 @@ mod tests {
             assert_eq!(dot(&a, &b), dot_expected, "dot n={n}");
             assert_eq!(l2_squared(&a, &b), l2_expected, "l2 n={n}");
         }
+    }
+
+    #[test]
+    fn cosine_with_norms_is_identical_to_cosine() {
+        for n in lengths() {
+            let a = pseudo_random(n, 7 + n as u64);
+            let b = pseudo_random(n, 77 + n as u64);
+            assert_eq!(
+                cosine_distance_with_norms(&a, &b, norm(&a), norm(&b)).to_bits(),
+                cosine_distance(&a, &b).to_bits(),
+                "n={n}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_with_norms_keeps_zero_vector_convention() {
+        let zero = [0.0; 9];
+        let v = pseudo_random(9, 3);
+        assert_eq!(cosine_distance_with_norms(&zero, &v, 0.0, norm(&v)), 1.0);
     }
 
     #[test]

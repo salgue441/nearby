@@ -5,6 +5,7 @@
 //! index (HNSW, PQ) is measured against.
 
 use crate::VectorIndex;
+use nearby_core::distance::{cosine_distance_with_norms, norm};
 use nearby_core::{Metric, PointId, Result, ScoredPoint, TopK, validate_vector};
 
 /// An exact (brute-force) vector index.
@@ -12,6 +13,10 @@ use nearby_core::{Metric, PointId, Result, ScoredPoint, TopK, validate_vector};
 /// Vectors are stored back to back in one contiguous buffer, which keeps a
 /// full scan cache-friendly. Ids live in a parallel `Vec`: the vector at
 /// position `i` belongs to `ids[i]`.
+///
+/// With [`Metric::Cosine`], each vector's norm is also stored at insert time,
+/// so a comparison costs one dot product instead of three. Vectors themselves
+/// are stored unmodified, so [`FlatIndex::get`] returns exactly what was added.
 ///
 /// # Examples
 ///
@@ -33,6 +38,9 @@ pub struct FlatIndex {
     metric: Metric,
     data: Vec<f32>,
     ids: Vec<PointId>,
+    /// `norms[i]` is the norm of vector `i`. Same length as `ids` for
+    /// [`Metric::Cosine`], always empty for the other metrics.
+    norms: Vec<f32>,
 }
 
 impl FlatIndex {
@@ -48,7 +56,13 @@ impl FlatIndex {
             metric,
             data: Vec::new(),
             ids: Vec::new(),
+            norms: Vec::new(),
         }
+    }
+
+    /// Whether this index keeps per-vector norms (see `norms`).
+    fn stores_norms(&self) -> bool {
+        self.metric == Metric::Cosine
     }
 
     /// Creates an empty index with room for `capacity` vectors, so loading
@@ -62,6 +76,9 @@ impl FlatIndex {
 
         index.data.reserve(capacity * dim);
         index.ids.reserve(capacity);
+        if index.stores_norms() {
+            index.norms.reserve(capacity);
+        }
         index
     }
 
@@ -81,6 +98,9 @@ impl FlatIndex {
         validate_vector(vector, self.dim)?;
         self.data.extend_from_slice(vector);
         self.ids.push(id);
+        if self.stores_norms() {
+            self.norms.push(norm(vector));
+        }
 
         Ok(())
     }
@@ -109,8 +129,18 @@ impl VectorIndex for FlatIndex {
         validate_vector(query, self.dim)?;
 
         let mut top = TopK::new(k);
-        for (vector, &id) in self.data.chunks_exact(self.dim).zip(&self.ids) {
-            top.push(id, self.metric.distance(query, vector));
+        let vectors = self.data.chunks_exact(self.dim).zip(&self.ids);
+
+        if self.stores_norms() {
+            let query_norm = norm(query);
+            for ((vector, &id), &vector_norm) in vectors.zip(&self.norms) {
+                let d = cosine_distance_with_norms(query, vector, query_norm, vector_norm);
+                top.push(id, d);
+            }
+        } else {
+            for (vector, &id) in vectors {
+                top.push(id, self.metric.distance(query, vector));
+            }
         }
 
         Ok(top.into_sorted())
@@ -195,5 +225,31 @@ mod tests {
         let index = line_index(Metric::L2);
         assert_eq!(index.get(3), Some(&[3.0, 0.0][..]));
         assert_eq!(index.get(5), None);
+    }
+
+    #[test]
+    fn cosine_index_stores_one_norm_per_vector() {
+        let index = line_index(Metric::Cosine);
+        assert_eq!(index.norms, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn other_metrics_store_no_norms() {
+        for metric in [Metric::L2, Metric::Dot] {
+            let index = line_index(metric);
+            assert!(index.norms.is_empty(), "{metric:?}");
+            assert_eq!(index.norms.capacity(), 0, "{metric:?}");
+        }
+        let index = FlatIndex::with_capacity(4, Metric::L2, 1_000);
+        assert_eq!(index.norms.capacity(), 0, "no memory reserved either");
+    }
+
+    #[test]
+    fn rejected_vector_stores_no_norm() {
+        let mut index = FlatIndex::new(2, Metric::Cosine);
+        index.add(1, &[3.0, 4.0]).unwrap();
+        assert!(index.add(2, &[f32::NAN, 0.0]).is_err());
+        assert!(index.add(3, &[1.0]).is_err());
+        assert_eq!(index.norms, vec![5.0]);
     }
 }
