@@ -10,5 +10,8 @@ nearby-core.workspace = true
 nearby-index.workspace = true
 anyhow.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

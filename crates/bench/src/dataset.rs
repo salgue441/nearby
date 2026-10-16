@@ -117,6 +117,7 @@ mod tests {
                 bytes.extend(value.to_le_bytes());
             }
         }
+
         bytes
     }
 
@@ -149,5 +150,80 @@ mod tests {
     #[test]
     fn rejects_empty_file() {
         assert!(parse_vecs(&[], f32::from_le_bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_dimension() {
+        let err = parse_vecs(&0u32.to_le_bytes(), f32::from_le_bytes).unwrap_err();
+        assert!(err.to_string().contains("dimension is 0"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_negative_dimension() {
+        // A negative `i32` header reads as a huge `u32`; no file is that big.
+        let mut bytes = (-1i32).to_le_bytes().to_vec();
+        bytes.extend(1f32.to_le_bytes());
+        assert!(parse_vecs(&bytes, f32::from_le_bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_header_without_values() {
+        let bytes = 3u32.to_le_bytes();
+        assert!(parse_vecs(&bytes, f32::from_le_bytes).is_err());
+    }
+
+    #[test]
+    fn vectors_len_and_iter() {
+        let v = Vectors {
+            dim: 2,
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        };
+        assert_eq!(v.len(), 3);
+        let rows: Vec<&[f32]> = v.iter().collect();
+        assert_eq!(rows, [&[1.0, 2.0][..], &[3.0, 4.0], &[5.0, 6.0]]);
+    }
+
+    #[test]
+    fn reads_fvecs_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.fvecs");
+        std::fs::write(&path, encode(&[&[1.5, -2.0], &[0.0, 8.25]])).unwrap();
+
+        let v = read_fvecs(&path).unwrap();
+        assert_eq!(v.dim, 2);
+        assert_eq!(v.data, vec![1.5, -2.0, 0.0, 8.25]);
+    }
+
+    #[test]
+    fn reads_ivecs_file_into_rows() {
+        let mut bytes = Vec::new();
+        for row in [[3u32, 1, 4], [1, 5, 9]] {
+            bytes.extend(3u32.to_le_bytes());
+            for id in row {
+                bytes.extend(id.to_le_bytes());
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groundtruth.ivecs");
+        std::fs::write(&path, bytes).unwrap();
+
+        assert_eq!(
+            read_ivecs(&path).unwrap(),
+            vec![vec![3, 1, 4], vec![1, 5, 9]]
+        );
+    }
+
+    #[test]
+    fn errors_name_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("missing.fvecs");
+        let err = format!("{:#}", read_fvecs(&missing).unwrap_err());
+        assert!(err.contains("missing.fvecs"), "got: {err}");
+
+        let corrupt = dir.path().join("corrupt.ivecs");
+        std::fs::write(&corrupt, [1, 0]).unwrap();
+        let err = format!("{:#}", read_ivecs(&corrupt).unwrap_err());
+        assert!(err.contains("corrupt.ivecs"), "got: {err}");
     }
 }

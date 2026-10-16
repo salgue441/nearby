@@ -179,4 +179,92 @@ mod tests {
         let cfg = Config::load_or_default(&dir.path().join("nope.toml")).unwrap();
         assert_eq!(cfg.log.level, "info");
     }
+
+    #[test]
+    fn defaults_are_documented_values() {
+        let cfg = Config::default();
+        assert_eq!(cfg.data_dir, PathBuf::from("./data"));
+
+        let log = cfg.log;
+        assert_eq!(log.level, "info");
+        assert!(log.console);
+        assert_eq!(log.console_format, ConsoleFormat::Full);
+        assert!(log.file);
+        assert_eq!(log.file_dir, PathBuf::from("./logs"));
+        assert_eq!(log.file_prefix, "nearby");
+        assert_eq!(log.rotation, Rotation::Daily);
+        assert_eq!(log.max_files, 14);
+    }
+
+    #[test]
+    fn every_enum_value_parses_from_lowercase() {
+        for (text, format) in [
+            ("full", ConsoleFormat::Full),
+            ("compact", ConsoleFormat::Compact),
+            ("json", ConsoleFormat::Json),
+        ] {
+            let cfg = Config::from_toml(&format!("log.console_format = \"{text}\"")).unwrap();
+            assert_eq!(cfg.log.console_format, format);
+        }
+
+        for (text, rotation) in [
+            ("minutely", Rotation::Minutely),
+            ("hourly", Rotation::Hourly),
+            ("daily", Rotation::Daily),
+            ("never", Rotation::Never),
+        ] {
+            let cfg = Config::from_toml(&format!("log.rotation = \"{text}\"")).unwrap();
+            assert_eq!(cfg.log.rotation, rotation);
+        }
+    }
+
+    #[test]
+    fn enum_values_are_case_sensitive() {
+        assert!(Config::from_toml("log.rotation = \"Daily\"").is_err());
+        assert!(Config::from_toml("log.rotation = \"weekly\"").is_err());
+    }
+
+    #[test]
+    fn unknown_keys_in_log_table_are_rejected() {
+        let err = Config::from_toml("[log]\nlevle = \"debug\"").unwrap_err();
+        assert!(err.to_string().contains("levle"), "got: {err}");
+    }
+
+    #[test]
+    fn wrong_value_types_are_rejected() {
+        assert!(Config::from_toml("log.console = \"yes\"").is_err());
+        assert!(Config::from_toml("log.max_files = -1").is_err());
+    }
+
+    #[test]
+    fn invalid_toml_is_rejected() {
+        assert!(Config::from_toml("data_dir = ").is_err());
+    }
+
+    #[test]
+    fn load_reads_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nearby.toml");
+        std::fs::write(&path, "[log]\nmax_files = 3\n").unwrap();
+
+        assert_eq!(Config::load(&path).unwrap().log.max_files, 3);
+        assert_eq!(Config::load_or_default(&path).unwrap().log.max_files, 3);
+    }
+
+    #[test]
+    fn load_fails_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = Config::load(&dir.path().join("nope.toml")).unwrap_err();
+        assert!(err.to_string().contains("nope.toml"), "got: {err}");
+    }
+
+    #[test]
+    fn load_or_default_still_reports_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "nonsense = true").unwrap();
+
+        let err = Config::load_or_default(&path).unwrap_err();
+        assert!(err.to_string().contains("bad.toml"), "got: {err}");
+    }
 }

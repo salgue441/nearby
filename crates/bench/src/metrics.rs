@@ -114,6 +114,55 @@ mod tests {
     }
 
     #[test]
+    fn fewer_results_than_k() {
+        let r = recall_at_k(&points(&[1]), &[1, 2, 3, 4], 4);
+        assert!((r - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn truth_shorter_than_k_is_the_denominator() {
+        let r = recall_at_k(&points(&[1, 2, 3]), &[1, 2], 3);
+        assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_truth_counts_as_perfect() {
+        assert!((recall_at_k(&points(&[1, 2]), &[], 2) - 1.0).abs() < 1e-9);
+        assert!((recall_at_k(&points(&[1, 2]), &[1, 2], 0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn order_within_the_first_k_does_not_matter() {
+        let r = recall_at_k(&points(&[4, 3, 2, 1]), &[1, 2, 3, 4], 4);
+        assert!((r - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn samples_need_not_be_sorted() {
+        let samples = [5, 1, 4, 2, 3].map(Duration::from_millis).to_vec();
+        let stats = LatencyStats::from_samples(samples).unwrap();
+        assert_eq!(stats.count, 5);
+        assert_eq!(stats.total, Duration::from_millis(15));
+        assert_eq!(stats.p50, Duration::from_millis(3));
+        assert_eq!(stats.max, Duration::from_millis(5));
+    }
+
+    #[test]
+    fn qps_is_count_over_total_time() {
+        let samples = vec![Duration::from_millis(250); 8];
+        let stats = LatencyStats::from_samples(samples).unwrap();
+        assert!((stats.qps() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percentile_bounds() {
+        let sorted = [10, 20, 30].map(Duration::from_millis);
+        assert_eq!(percentile(&sorted, 0.0), Duration::from_millis(10));
+        assert_eq!(percentile(&sorted, 34.0), Duration::from_millis(20));
+        assert_eq!(percentile(&sorted, 100.0), Duration::from_millis(30));
+    }
+
+    #[test]
     fn percentiles_use_nearest_rank() {
         let samples: Vec<Duration> = (1..=100).map(Duration::from_millis).collect();
         let stats = LatencyStats::from_samples(samples).unwrap();

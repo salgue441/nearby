@@ -151,6 +151,7 @@ dependencies = [
  "anyhow",
  "nearby-core",
  "nearby-index",
+ "tempfile",
 ]
 
 [[package]]
