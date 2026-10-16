@@ -103,9 +103,13 @@ impl SearchCtx<'_> {
     ///
     /// `candidates` must be sorted closest first, with distances measured from
     /// the node being linked. Instead of simply taking the `m` closest, a
-    /// candidate is kept only if it's closer to that node than to every
-    /// neighbor already kept. That spreads links across different directions,
+    /// candidate is dropped if some neighbor already kept is strictly closer
+    /// to it than the node is. That spreads links across different directions,
     /// so searches can escape tight clusters, which greatly improves recall.
+    ///
+    /// Ties are kept, as in hnswlib. With a strict comparison, a candidate
+    /// identical to the node (distance 0 to both) would always be dropped,
+    /// leaving duplicate vectors with a single link each.
     pub(super) fn select_neighbors(&self, candidates: &[Neighbor], m: usize) -> Vec<Neighbor> {
         let mut selected: Vec<Neighbor> = Vec::with_capacity(m);
         for &candidate in candidates {
@@ -116,7 +120,7 @@ impl SearchCtx<'_> {
             let is_diverse = selected.iter().all(|kept| {
                 self.metric
                     .distance(vector, self.store.get(kept.node as usize))
-                    > candidate.distance
+                    >= candidate.distance
             });
             if is_diverse {
                 selected.push(candidate);
@@ -267,5 +271,24 @@ mod tests {
         // All candidates lie in one direction: each is closer to the previous
         // one than to the origin, so only the nearest is kept.
         assert_eq!(nodes(&ctx.select_neighbors(&candidates, 4)), vec![1]);
+    }
+
+    #[test]
+    fn select_neighbors_keeps_ties() {
+        // Linking a node at the origin. Nodes 0-2 are exact copies of it: each
+        // is as close to the kept copies (0) as to the node (0), so all are
+        // kept; a strict comparison would keep only the first. Node 3 is as
+        // far from the kept copies as from the node (they share a position),
+        // so it ties too: a neighbor on top of the node covers no direction.
+        let store = store(&[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [5.0, 5.0]]);
+        let graph = Graph::with_capacity(2, 0);
+        let ctx = ctx(&store, &graph);
+        let origin = [0.0, 0.0];
+        let candidates: Vec<Neighbor> = (0..4).map(|n| ctx.neighbor(&origin, n)).collect();
+
+        assert_eq!(
+            nodes(&ctx.select_neighbors(&candidates, 4)),
+            vec![0, 1, 2, 3]
+        );
     }
 }
