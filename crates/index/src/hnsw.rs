@@ -16,6 +16,7 @@ mod visited;
 
 use std::sync::{Mutex, PoisonError};
 
+use nearby_core::distance::norm;
 use nearby_core::{Error, Metric, PointId, Result, ScoredPoint, validate_vector};
 
 use self::graph::Graph;
@@ -63,6 +64,10 @@ pub struct Hnsw {
     params: HnswParams,
     metric: Metric,
     store: VectorStore,
+    /// `norms[node]` is the norm of vector `node` when the metric is
+    /// [`Metric::Cosine`], so comparisons cost one dot product instead of
+    /// three. Empty for other metrics.
+    norms: Vec<f32>,
     /// `ids[node]` is the external id of internal node `node`.
     ids: Vec<PointId>,
     graph: Graph,
@@ -104,6 +109,11 @@ impl Hnsw {
         params.validate()?;
         Ok(Self {
             store: VectorStore::with_capacity(dim, capacity),
+            norms: if metric == Metric::Cosine {
+                Vec::with_capacity(capacity)
+            } else {
+                Vec::new()
+            },
             ids: Vec::with_capacity(capacity),
             graph: Graph::with_capacity(params.m0, capacity),
             entry_point: None,
@@ -159,6 +169,9 @@ impl Hnsw {
         })?;
         let level = self.random_level();
         self.store.push(vector);
+        if self.metric == Metric::Cosine {
+            self.norms.push(norm(vector));
+        }
         self.ids.push(id);
         self.graph.add_node(level);
 
@@ -171,18 +184,19 @@ impl Hnsw {
 
         let mut visited = self.take_visited();
         let ctx = self.ctx();
+        let query = ctx.query(vector);
 
         // Phase 1: above the new node's top layer, just descend greedily.
-        let mut ep = ctx.neighbor(vector, entry);
+        let mut ep = ctx.neighbor(&query, entry);
         for l in (level + 1..=self.max_level).rev() {
-            ep = ctx.greedy_closest(vector, ep, l, &mut visited);
+            ep = ctx.greedy_closest(&query, ep, l, &mut visited);
         }
 
         // Phase 2: on every layer the node lives on, find neighbors and link them.
         for l in (0..=level.min(self.max_level)).rev() {
             let ctx = self.ctx();
             let candidates =
-                ctx.search_layer(vector, &[ep], self.params.ef_construction, l, &mut visited);
+                ctx.search_layer(&query, &[ep], self.params.ef_construction, l, &mut visited);
             let selected = ctx.select_neighbors(&candidates, self.params.m);
             ep = candidates[0];
             self.connect(node, l, &selected);
@@ -211,12 +225,12 @@ impl Hnsw {
                 links.push(node);
             } else {
                 let ctx = self.ctx();
-                let base = self.store.get(neighbor.node as usize);
+                let base = ctx.node_query(neighbor.node);
                 let mut candidates: Vec<Neighbor> = links
                     .iter()
                     .copied()
                     .chain([node])
-                    .map(|n| ctx.neighbor(base, n))
+                    .map(|n| ctx.neighbor(&base, n))
                     .collect();
                 candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
                 links = ctx
@@ -246,6 +260,7 @@ impl Hnsw {
             store: &self.store,
             graph: &self.graph,
             metric: self.metric,
+            norms: &self.norms,
         }
     }
 
@@ -285,12 +300,13 @@ impl VectorIndex for Hnsw {
 
         let mut visited = self.take_visited();
         let ctx = self.ctx();
-        let mut ep = ctx.neighbor(query, entry);
+        let query = ctx.query(query);
+        let mut ep = ctx.neighbor(&query, entry);
         for l in (1..=self.max_level).rev() {
-            ep = ctx.greedy_closest(query, ep, l, &mut visited);
+            ep = ctx.greedy_closest(&query, ep, l, &mut visited);
         }
         let ef = self.params.ef_search.max(k);
-        let found = ctx.search_layer(query, &[ep], ef, 0, &mut visited);
+        let found = ctx.search_layer(&query, &[ep], ef, 0, &mut visited);
         self.return_visited(visited);
 
         Ok(found
@@ -524,6 +540,22 @@ mod tests {
         index.search(&[2.0, 2.0], 5).unwrap();
         let pooled = index.visited_pool.lock().unwrap().len();
         assert_eq!(pooled, 1, "sequential searches reuse one visited set");
+    }
+
+    #[test]
+    fn norms_are_stored_only_for_cosine() {
+        let mut cosine = Hnsw::new(2, Metric::Cosine, HnswParams::default()).unwrap();
+        let mut l2 = Hnsw::new(2, Metric::L2, HnswParams::default()).unwrap();
+        for (id, v) in [[3.0, 4.0], [1.0, 0.0]].iter().enumerate() {
+            cosine.insert(id as PointId, v).unwrap();
+            l2.insert(id as PointId, v).unwrap();
+        }
+        assert_eq!(cosine.norms, vec![5.0, 1.0]);
+        assert!(l2.norms.is_empty(), "L2 keeps no norms");
+        assert!(
+            cosine.insert(9, &[f32::NAN, 0.0]).is_err() && cosine.norms.len() == 2,
+            "a rejected vector stores no norm"
+        );
     }
 
     #[test]

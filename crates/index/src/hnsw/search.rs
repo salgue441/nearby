@@ -3,11 +3,22 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
+use nearby_core::distance::{cosine_distance_with_norms, norm};
 use nearby_core::{Metric, OrdF32, TopK};
 
 use super::graph::Graph;
 use super::visited::VisitedSet;
 use crate::store::VectorStore;
+
+/// A vector to measure distances from, with its norm when the metric needs it.
+///
+/// Build it with [`SearchCtx::query`], so the norm always matches the vector.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Query<'a> {
+    vector: &'a [f32],
+    /// `norm(vector)` for [`Metric::Cosine`]; unused (0) for other metrics.
+    norm: f32,
+}
 
 /// A node and its distance to whatever we're currently measuring from.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,16 +35,46 @@ pub(super) struct SearchCtx<'a> {
     pub store: &'a VectorStore,
     pub graph: &'a Graph,
     pub metric: Metric,
+    /// `norms[node]` is the norm of stored vector `node` for
+    /// [`Metric::Cosine`], so a cosine comparison costs one dot product
+    /// instead of three. Empty for other metrics.
+    pub norms: &'a [f32],
 }
 
-impl SearchCtx<'_> {
-    /// Measures the distance from `query` to `node`.
-    #[inline]
-    pub(super) fn neighbor(&self, query: &[f32], node: u32) -> Neighbor {
-        Neighbor {
-            node,
-            distance: self.metric.distance(query, self.store.get(node as usize)),
+impl<'a> SearchCtx<'a> {
+    /// Prepares `vector` for distance measurements, computing its norm once
+    /// if the metric needs it.
+    pub(super) fn query<'q>(&self, vector: &'q [f32]) -> Query<'q> {
+        let norm = if self.norms.is_empty() {
+            0.0
+        } else {
+            norm(vector)
+        };
+        Query { vector, norm }
+    }
+
+    /// Prepares stored vector `node` for distance measurements, reusing its
+    /// stored norm.
+    pub(super) fn node_query(&self, node: u32) -> Query<'a> {
+        Query {
+            vector: self.store.get(node as usize),
+            norm: self.norms.get(node as usize).copied().unwrap_or(0.0),
         }
+    }
+
+    /// Measures the distance from `query` to `node`.
+    ///
+    /// With stored norms this is bit-for-bit the same as
+    /// [`Metric::distance`], just cheaper.
+    #[inline]
+    pub(super) fn neighbor(&self, query: &Query<'_>, node: u32) -> Neighbor {
+        let vector = self.store.get(node as usize);
+        let distance = if self.norms.is_empty() {
+            self.metric.distance(query.vector, vector)
+        } else {
+            cosine_distance_with_norms(query.vector, vector, query.norm, self.norms[node as usize])
+        };
+        Neighbor { node, distance }
     }
 
     /// Best-first search on one layer (Algorithm 2 in the paper).
@@ -42,7 +83,7 @@ impl SearchCtx<'_> {
     /// returns at least the entry points, so the result is never empty.
     pub(super) fn search_layer(
         &self,
-        query: &[f32],
+        query: &Query<'_>,
         entry_points: &[Neighbor],
         ef: usize,
         level: usize,
@@ -91,7 +132,7 @@ impl SearchCtx<'_> {
     /// Greedy search with `ef = 1`: used to descend quickly through the upper layers.
     pub(super) fn greedy_closest(
         &self,
-        query: &[f32],
+        query: &Query<'_>,
         entry: Neighbor,
         level: usize,
         visited: &mut VisitedSet,
@@ -116,12 +157,10 @@ impl SearchCtx<'_> {
             if selected.len() >= m {
                 break;
             }
-            let vector = self.store.get(candidate.node as usize);
-            let is_diverse = selected.iter().all(|kept| {
-                self.metric
-                    .distance(vector, self.store.get(kept.node as usize))
-                    >= candidate.distance
-            });
+            let from = self.node_query(candidate.node);
+            let is_diverse = selected
+                .iter()
+                .all(|kept| self.neighbor(&from, kept.node).distance >= candidate.distance);
             if is_diverse {
                 selected.push(candidate);
             }
@@ -159,10 +198,11 @@ mod tests {
             store: &store,
             graph: &graph,
             metric: Metric::L2,
+            norms: &[],
         };
         let mut visited = VisitedSet::default();
 
-        let query = [3.9, 0.0];
+        let query = ctx.query(&[3.9, 0.0]);
         let start = ctx.neighbor(&query, 0);
         assert_eq!(ctx.greedy_closest(&query, start, 0, &mut visited).node, 4);
 
@@ -181,8 +221,9 @@ mod tests {
             store: &store,
             graph: &graph,
             metric: Metric::L2,
+            norms: &[],
         };
-        let origin = [0.0, 0.0];
+        let origin = ctx.query(&[0.0, 0.0]);
         let candidates: Vec<Neighbor> = (0..3).map(|n| ctx.neighbor(&origin, n)).collect();
 
         let selected = ctx.select_neighbors(&candidates, 2);
@@ -210,6 +251,7 @@ mod tests {
             store,
             graph,
             metric: Metric::L2,
+            norms: &[],
         }
     }
 
@@ -222,7 +264,7 @@ mod tests {
         let (store, graph) = line();
         let ctx = ctx(&store, &graph);
         let mut visited = VisitedSet::default();
-        let query = [2.2, 0.0];
+        let query = ctx.query(&[2.2, 0.0]);
         let start = ctx.neighbor(&query, 0);
 
         let found = ctx.search_layer(&query, &[start], 10, 0, &mut visited);
@@ -240,7 +282,7 @@ mod tests {
         graph.set_neighbors(2, 0, &[1]); // cut the 2 -> 3 edge
         let ctx = ctx(&store, &graph);
         let mut visited = VisitedSet::default();
-        let query = [4.0, 0.0];
+        let query = ctx.query(&[4.0, 0.0]);
         let start = ctx.neighbor(&query, 0);
 
         let found = ctx.search_layer(&query, &[start], 10, 0, &mut visited);
@@ -252,7 +294,7 @@ mod tests {
         let (store, graph) = line();
         let ctx = ctx(&store, &graph);
         let mut visited = VisitedSet::default();
-        let query = [0.0, 0.0];
+        let query = ctx.query(&[0.0, 0.0]);
         let entries = [ctx.neighbor(&query, 4), ctx.neighbor(&query, 1)];
 
         let found = ctx.search_layer(&query, &entries, 2, 0, &mut visited);
@@ -263,7 +305,7 @@ mod tests {
     fn select_neighbors_edge_cases() {
         let (store, graph) = line();
         let ctx = ctx(&store, &graph);
-        let origin = [0.0, 0.0];
+        let origin = ctx.query(&[0.0, 0.0]);
         let candidates: Vec<Neighbor> = (1..5).map(|n| ctx.neighbor(&origin, n)).collect();
 
         assert!(ctx.select_neighbors(&candidates, 0).is_empty(), "m = 0");
@@ -271,6 +313,37 @@ mod tests {
         // All candidates lie in one direction: each is closer to the previous
         // one than to the origin, so only the nearest is kept.
         assert_eq!(nodes(&ctx.select_neighbors(&candidates, 4)), vec![1]);
+    }
+
+    #[test]
+    fn cosine_with_stored_norms_matches_the_metric_exactly() {
+        let points = [[3.0, 4.0], [-1.0, 2.0], [0.5, -0.25], [0.0, 0.0]];
+        let store = store(&points);
+        let norms: Vec<f32> = points.iter().map(|p| norm(p)).collect();
+        let graph = Graph::with_capacity(2, 0);
+        let ctx = SearchCtx {
+            store: &store,
+            graph: &graph,
+            metric: Metric::Cosine,
+            norms: &norms,
+        };
+
+        let raw = [2.0, -7.0];
+        let query = ctx.query(&raw);
+        for node in 0..4u32 {
+            let expected = Metric::Cosine.distance(&raw, &points[node as usize]);
+            assert_eq!(
+                ctx.neighbor(&query, node).distance.to_bits(),
+                expected.to_bits()
+            );
+
+            let from_node = ctx.node_query(node);
+            let expected = Metric::Cosine.distance(&points[node as usize], &points[0]);
+            assert_eq!(
+                ctx.neighbor(&from_node, 0).distance.to_bits(),
+                expected.to_bits()
+            );
+        }
     }
 
     #[test]
@@ -283,7 +356,7 @@ mod tests {
         let store = store(&[[0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [5.0, 5.0]]);
         let graph = Graph::with_capacity(2, 0);
         let ctx = ctx(&store, &graph);
-        let origin = [0.0, 0.0];
+        let origin = ctx.query(&[0.0, 0.0]);
         let candidates: Vec<Neighbor> = (0..4).map(|n| ctx.neighbor(&origin, n)).collect();
 
         assert_eq!(

@@ -153,6 +153,21 @@ fn dot_metric_matches_exact_search() {
 }
 
 #[test]
+fn cosine_distances_are_bit_identical_to_the_metric() {
+    // The index uses stored norms; results must not change because of it.
+    let data = random_vectors(300, DIM, 13);
+    let mut index = Hnsw::new(DIM, Metric::Cosine, HnswParams::default()).unwrap();
+    for (i, v) in data.iter().enumerate() {
+        index.insert(i as PointId, v).unwrap();
+    }
+    let query = &random_vectors(1, DIM, 14)[0];
+    for p in index.search(query, 20).unwrap() {
+        let expected = Metric::Cosine.distance(query, &data[p.id as usize]);
+        assert_eq!(p.distance.to_bits(), expected.to_bits(), "id {}", p.id);
+    }
+}
+
+#[test]
 fn same_seed_and_order_give_identical_results() {
     let data = random_vectors(500, DIM, 8);
     let a = build(Metric::L2, HnswParams::default(), &data);
