@@ -164,6 +164,15 @@ dependencies = [
 [[package]]
 name = "nearby-engine"
 version = "0.1.0"
+dependencies = [
+ "nearby-core",
+ "nearby-index",
+ "nearby-storage",
+ "serde",
+ "tempfile",
+ "toml",
+ "tracing",
+]
 
 [[package]]
 name = "nearby-index"
