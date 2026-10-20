@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use nearby_core::{Error, Metric, Result};
-use nearby_index::HnswParams;
+use nearby_index::{HnswParams, PqParams, ProductQuantizer};
 use serde::{Deserialize, Serialize};
 
 /// A collection's settings, fixed when it is created.
@@ -31,6 +31,8 @@ pub enum IndexConfig {
     Flat,
     /// Approximate search over an HNSW graph.
     Hnsw(HnswConfig),
+    /// Approximate search over product-quantized codes, re-ranked exactly.
+    Pq(PqConfig),
 }
 
 impl Default for IndexConfig {
@@ -72,6 +74,67 @@ impl HnswConfig {
             ef_search: self.ef_search,
             ..HnswParams::default()
         }
+    }
+}
+
+/// Product quantization settings. Missing fields take the defaults below.
+///
+/// Until `training_points` points have been written, searches are exact.
+/// The quantizer is then trained on those points, every point is encoded,
+/// and from then on a search scans the codes for `rerank * k` candidates and
+/// returns the best `k` by exact distance. The quantizer is retrained
+/// whenever the index is rebuilt: on open, and after many deletes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PqConfig {
+    /// Slices each vector is split into, which is also the code length in
+    /// bytes. Must divide the dimension. Default: 16.
+    pub subspaces: usize,
+    /// Points written before the quantizer is trained on them. At least
+    /// 256. Default: 10 000.
+    pub training_points: usize,
+    /// Candidates fetched per requested result and re-ranked by exact
+    /// distance. At least 1. Default: 10.
+    pub rerank: usize,
+}
+
+impl Default for PqConfig {
+    fn default() -> Self {
+        Self {
+            subspaces: PqParams::default().subspaces,
+            training_points: 10_000,
+            rerank: 10,
+        }
+    }
+}
+
+impl PqConfig {
+    /// The quantizer training parameters these settings stand for.
+    pub fn params(&self) -> PqParams {
+        PqParams::with_subspaces(self.subspaces)
+    }
+
+    /// Checks that these settings work for `dim`-dimensional vectors.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParameter`] if `subspaces` doesn't divide `dim`,
+    /// `training_points` is below 256, or `rerank` is 0.
+    pub fn validate(&self, dim: usize) -> Result<()> {
+        self.params().validate(dim)?;
+        if self.training_points < ProductQuantizer::MIN_TRAINING {
+            return Err(Error::InvalidParameter(format!(
+                "training_points must be at least {}, got {}",
+                ProductQuantizer::MIN_TRAINING,
+                self.training_points
+            )));
+        }
+        if self.rerank == 0 {
+            return Err(Error::InvalidParameter(
+                "rerank must be at least 1".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -128,6 +191,47 @@ mod tests {
 
         let flat: CollectionConfig = toml::from_str("dim = 2\n[index]\ntype = \"flat\"").unwrap();
         assert_eq!(flat.index, IndexConfig::Flat);
+    }
+
+    #[test]
+    fn pq_settings_parse_with_defaults() {
+        let config: CollectionConfig =
+            toml::from_str("dim = 64\n[index]\ntype = \"pq\"\nsubspaces = 8\n").unwrap();
+        let IndexConfig::Pq(pq) = &config.index else {
+            panic!("expected pq");
+        };
+        assert_eq!(
+            (pq.subspaces, pq.training_points, pq.rerank),
+            (8, 10_000, 10)
+        );
+        assert!(pq.validate(config.dim).is_ok());
+    }
+
+    #[test]
+    fn unusable_pq_settings_are_rejected() {
+        let cases = [
+            (PqConfig::default(), 12, "subspaces must divide"),
+            (
+                PqConfig {
+                    training_points: 255,
+                    ..PqConfig::default()
+                },
+                16,
+                "training_points must be at least 256",
+            ),
+            (
+                PqConfig {
+                    rerank: 0,
+                    ..PqConfig::default()
+                },
+                16,
+                "rerank",
+            ),
+        ];
+        for (pq, dim, expected) in cases {
+            let err = pq.validate(dim).unwrap_err().to_string();
+            assert!(err.contains(expected), "{pq:?}, dim {dim}: {err}");
+        }
     }
 
     #[test]

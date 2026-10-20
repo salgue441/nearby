@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use nearby_core::{Error, PointId, Result, ScoredPoint, validate_vector};
+use nearby_core::{Error, PointId, Result, ScoredPoint, TopK, validate_vector};
 use nearby_storage::{CollectionStore, Op, StoreOptions};
 use serde::Serialize;
 
@@ -276,12 +276,17 @@ impl Collection {
     /// is not a valid vector for this collection.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.config.dim)?;
+        let rerank = self.index.rerank();
+        let candidates = rerank.map_or(k, |factor| k.saturating_mul(factor.get()));
         let live = |slot: PointId| self.points.live_id(slot as u32).is_some();
-        let hits = if self.points.dead() == 0 {
-            self.index.search(query, k)?
+        let mut hits = if self.points.dead() == 0 {
+            self.index.search(query, candidates)?
         } else {
-            self.index.search_filtered(query, k, &live)?
+            self.index.search_filtered(query, candidates, &live)?
         };
+        if rerank.is_some() {
+            hits = self.rerank(query, k, &hits);
+        }
         Ok(hits
             .into_iter()
             .filter_map(|hit| {
@@ -291,6 +296,16 @@ impl Collection {
                 })
             })
             .collect())
+    }
+
+    /// The `k` best of `candidates` (slots) by exact distance to `query`.
+    fn rerank(&self, query: &[f32], k: usize, candidates: &[ScoredPoint]) -> Vec<ScoredPoint> {
+        let mut top = TopK::new(k);
+        for hit in candidates {
+            let vector = self.points.vector(hit.id as u32);
+            top.push(hit.id, self.config.metric.distance(query, vector));
+        }
+        top.into_sorted()
     }
 
     /// Moves the write-ahead log into a segment, so reopening replays less.
@@ -411,7 +426,7 @@ mod tests {
     use nearby_storage::Durability;
 
     use super::*;
-    use crate::config::{HnswConfig, IndexConfig};
+    use crate::config::{HnswConfig, IndexConfig, PqConfig};
 
     fn options() -> EngineOptions {
         EngineOptions {
@@ -432,13 +447,23 @@ mod tests {
         results.iter().map(|p| p.id).collect()
     }
 
-    fn both_indexes() -> [IndexConfig; 2] {
-        [IndexConfig::Flat, IndexConfig::Hnsw(HnswConfig::default())]
+    /// One config per index type. The PQ collection trains at 256 points,
+    /// so with fewer it searches exactly.
+    fn every_index() -> [IndexConfig; 3] {
+        [
+            IndexConfig::Flat,
+            IndexConfig::Hnsw(HnswConfig::default()),
+            IndexConfig::Pq(PqConfig {
+                subspaces: 2,
+                training_points: 256,
+                rerank: 2,
+            }),
+        ]
     }
 
     #[test]
     fn upserts_deletes_and_searches() {
-        for index in both_indexes() {
+        for index in every_index() {
             let dir = tempfile::tempdir().unwrap();
             let mut c = Collection::create(dir.path(), "c", config(index), options()).unwrap();
             c.upsert(&[(1, &[0.0, 0.0]), (2, &[1.0, 0.0]), (3, &[5.0, 5.0])])
@@ -461,7 +486,7 @@ mod tests {
 
     #[test]
     fn state_survives_reopening() {
-        for index in both_indexes() {
+        for index in every_index() {
             let dir = tempfile::tempdir().unwrap();
             let mut c = Collection::create(dir.path(), "c", config(index), options()).unwrap();
             c.upsert(&[(1, &[1.0, 1.0]), (2, &[2.0, 2.0])]).unwrap();
@@ -629,9 +654,79 @@ mod tests {
             ..HnswConfig::default()
         }));
         assert!(Collection::create(&dir.path().join("b"), "b", bad_m, options()).is_err());
+        // 16 subspaces don't divide 2 dimensions.
+        let bad_pq = config(IndexConfig::Pq(PqConfig::default()));
+        assert!(Collection::create(&dir.path().join("c"), "c", bad_pq, options()).is_err());
         assert!(
             !dir.path().join("b").exists(),
             "nothing is created for a bad config"
         );
+    }
+
+    /// 2000 pseudo-random 8-d points, ids `0..2000`.
+    fn pq_points() -> Vec<(PointId, Vec<f32>)> {
+        let mut state = 0x2545_F491_u32;
+        (0..2_000)
+            .map(|id| {
+                let v = (0..8)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        (state % 1000) as f32 / 10.0
+                    })
+                    .collect();
+                (id, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pq_collections_rerank_with_exact_distances() {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 4,
+            training_points: 500,
+            rerank: 10,
+        });
+        let config = CollectionConfig {
+            dim: 8,
+            ..config(pq)
+        };
+        let mut c = Collection::create(dir.path(), "c", config, options()).unwrap();
+        let points = pq_points();
+        let batch: Vec<(PointId, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+        c.upsert(&batch).unwrap();
+        assert!(c.index.rerank().is_some(), "trained");
+
+        // Every point finds itself, at its exact distance of 0.
+        let found = points
+            .iter()
+            .filter(|(id, v)| {
+                c.search(v, 1).unwrap()[0]
+                    == ScoredPoint {
+                        id: *id,
+                        distance: 0.0,
+                    }
+            })
+            .count();
+        assert!(found >= 1_990, "{found} of 2000 found themselves");
+
+        let query = &points[7].1;
+        let hits = c.search(query, 5).unwrap();
+        for hit in &hits {
+            let exact = Metric::L2.distance(query, c.get(hit.id).unwrap());
+            assert_eq!(hit.distance, exact, "distances are exact");
+        }
+
+        c.upsert(&[(7, &[500.0; 8])]).unwrap();
+        c.delete(&[hits[1].id]).unwrap();
+        let after = c.search(query, 5).unwrap();
+        assert!(after.iter().all(|p| p.id != 7 && p.id != hits[1].id));
+        drop(c);
+
+        // Retraining on reopen sees the same points in the same order.
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert_eq!(c.search(query, 5).unwrap(), after);
     }
 }
