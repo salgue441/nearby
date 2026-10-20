@@ -478,9 +478,14 @@ requests and flushes every collection before exiting.
   for a body over `max_body_bytes`, `422` for JSON of the wrong shape.
 - `k` defaults to 10 and is at most 10,000. Ties come back in write order.
 
+- **Authentication.** Set `api_key` under `[server]`, or the `NEARBY_API_KEY`
+  environment variable, and every endpoint but `/health` requires
+  `Authorization: Bearer <key>`, answering `401` without it.
+
 > [!WARNING]
-> The API has no authentication. It listens on `127.0.0.1` by default; put it
-> behind a proxy that authenticates before exposing it on a network.
+> Without an API key, every request is accepted. The server listens on
+> `127.0.0.1` by default; set a key, and terminate TLS in front of it (the
+> key travels in a header), before exposing it on a network.
 
 <details>
 <summary><b>Every configuration key and its default</b></summary>
@@ -491,6 +496,7 @@ data_dir = "./data"
 [server]
 listen = "127.0.0.1:7700"
 max_body_bytes = 67108864 # 64 MiB
+# api_key = "..."        # require "Authorization: Bearer <key>"; NEARBY_API_KEY overrides it
 
 [engine]
 durability = "sync"       # "sync": every write is on disk before it's acknowledged

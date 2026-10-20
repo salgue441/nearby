@@ -4,6 +4,7 @@
 //! Usage: `cargo run -p nearby-server -- [path/to/nearby.toml]`
 
 mod api;
+mod auth;
 mod config;
 mod telemetry;
 
@@ -13,6 +14,8 @@ use std::sync::Arc;
 use anyhow::Context;
 use nearby_engine::Database;
 
+use crate::api::ApiOptions;
+use crate::auth::ApiKey;
 use crate::config::Config;
 
 #[tokio::main]
@@ -45,13 +48,24 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("listening on {}", config.server.listen))?;
     tracing::info!(address = %listener.local_addr()?, "serving the HTTP API");
 
-    axum::serve(
-        listener,
-        api::router(Arc::clone(&db), config.server.max_body_bytes),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("serving the HTTP API")?;
+    let api_key = std::env::var("NEARBY_API_KEY")
+        .ok()
+        .or_else(|| config.server.api_key.clone())
+        .map(|key| ApiKey::new(&key))
+        .transpose()
+        .context("invalid API key")?;
+    if api_key.is_none() {
+        tracing::warn!("no API key configured: every request is accepted");
+    }
+    let options = ApiOptions {
+        max_body_bytes: config.server.max_body_bytes,
+        api_key,
+    };
+
+    axum::serve(listener, api::router(Arc::clone(&db), options))
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .context("serving the HTTP API")?;
 
     tracing::info!("shutting down: flushing collections");
     tokio::task::spawn_blocking(move || db.flush_all())

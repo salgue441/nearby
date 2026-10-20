@@ -12,13 +12,16 @@
 //! | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
 //! | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.5}]}` |
 //!
-//! Errors come back as `{"error": "..."}` with a 4xx or 5xx status.
+//! Errors come back as `{"error": "..."}` with a 4xx or 5xx status. With an
+//! API key configured, every endpoint but `/health` requires
+//! `Authorization: Bearer <key>` and answers `401` without it.
 
 use std::sync::{Arc, PoisonError};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
@@ -27,17 +30,17 @@ use nearby_engine::{CollectionConfig, CollectionInfo, Database};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::auth::{ApiKey, require_api_key};
+
 /// Largest `k` a search may ask for.
 const MAX_K: usize = 10_000;
 
 /// Shared state of every handler.
 type Db = Arc<Database>;
 
-/// The API's routes, serving `db`, accepting request bodies of up to
-/// `max_body_bytes`.
-pub fn router(db: Db, max_body_bytes: usize) -> Router {
-    Router::new()
-        .route("/health", get(health))
+/// The API's routes, serving `db`.
+pub fn router(db: Db, options: ApiOptions) -> Router {
+    let mut api = Router::new()
         .route("/collections", get(list_collections))
         .route(
             "/collections/{name}",
@@ -48,9 +51,23 @@ pub fn router(db: Db, max_body_bytes: usize) -> Router {
         .route("/collections/{name}/points", put(upsert_points))
         .route("/collections/{name}/points/delete", post(delete_points))
         .route("/collections/{name}/points/{id}", get(get_point))
-        .route("/collections/{name}/search", post(search))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .route("/collections/{name}/search", post(search));
+    if let Some(key) = options.api_key {
+        api = api.route_layer(middleware::from_fn_with_state(key, require_api_key));
+    }
+    // Health checks stay open, so load balancers need no key.
+    api.route("/health", get(health))
+        .layer(DefaultBodyLimit::max(options.max_body_bytes))
         .with_state(db)
+}
+
+/// How the API is served.
+#[derive(Debug, Clone)]
+pub struct ApiOptions {
+    /// Largest request body accepted, in bytes.
+    pub max_body_bytes: usize,
+    /// When set, every endpoint but `/health` requires this key as a bearer token.
+    pub api_key: Option<ApiKey>,
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -321,7 +338,13 @@ mod tests {
         fn in_dir(dir: tempfile::TempDir) -> Self {
             let db = Database::open(dir.path(), options()).unwrap();
             Self {
-                app: router(Arc::new(db), 1 << 20),
+                app: router(
+                    Arc::new(db),
+                    ApiOptions {
+                        max_body_bytes: 1 << 20,
+                        api_key: None,
+                    },
+                ),
                 dir,
             }
         }
@@ -362,6 +385,40 @@ mod tests {
                 .await;
             assert_eq!(status, StatusCode::CREATED);
         }
+    }
+
+    #[tokio::test]
+    async fn an_api_key_guards_everything_but_health() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path(), options()).unwrap();
+        let app = router(
+            Arc::new(db),
+            ApiOptions {
+                max_body_bytes: 1 << 20,
+                api_key: Some(ApiKey::new("s3cret").unwrap()),
+            },
+        );
+        let status = |uri: &str, key: Option<&str>| {
+            let mut request = Request::builder().uri(uri);
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            let request = request.body(Body::empty()).unwrap();
+            let app = app.clone();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+        assert_eq!(status("/health", None).await, StatusCode::OK);
+        assert_eq!(status("/collections", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            status("/collections", Some("wrong")).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(status("/collections", Some("s3cret")).await, StatusCode::OK);
+        assert_eq!(
+            status("/collections/missing", None).await,
+            StatusCode::UNAUTHORIZED,
+            "no information leaks without the key"
+        );
     }
 
     #[tokio::test]
