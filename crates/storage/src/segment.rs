@@ -32,8 +32,8 @@ use crate::fsio::atomic_write;
 use crate::wal::Op;
 use nearby_core::checksum::crc32;
 
-const MAGIC_V1: &[u8; 8] = b"NBSEG001";
-const MAGIC: &[u8; 8] = b"NBSEG002";
+pub(crate) const MAGIC_V1: &[u8; 8] = b"NBSEG001";
+pub(crate) const MAGIC: &[u8; 8] = b"NBSEG002";
 
 /// A point's final vector and payload.
 type Upsert = (Vec<f32>, Vec<u8>);
@@ -60,8 +60,10 @@ impl Changes {
         };
     }
 
-    /// Forgets every delete. Used when the changes become the oldest segment,
-    /// where there is nothing older left for a delete to remove.
+    /// Forgets every delete, as compaction does: the oldest segment has
+    /// nothing older left for a delete to remove. Tests use it as the
+    /// in-memory reference for the streaming merge.
+    #[cfg(test)]
     pub(crate) fn drop_deletes(&mut self) {
         self.points.retain(|_, upsert| upsert.is_some());
     }

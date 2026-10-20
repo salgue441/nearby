@@ -20,6 +20,7 @@
 mod codec;
 mod fsio;
 mod manifest;
+mod merge;
 mod segment;
 mod store;
 mod wal;
