@@ -41,7 +41,7 @@ impl PqParams {
     ///
     /// [`Error::InvalidParameter`] if `dim` or `subspaces` is 0, `subspaces`
     /// does not divide `dim`, or `iterations` is 0.
-    pub(super) fn validate(&self, dim: usize) -> Result<()> {
+    pub fn validate(&self, dim: usize) -> Result<()> {
         if dim == 0 {
             return invalid("dimension must be at least 1".to_owned());
         }
