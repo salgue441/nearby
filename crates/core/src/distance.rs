@@ -230,6 +230,7 @@ mod tests {
     /// Every (dot, l2) kernel pair this CPU can run, by name. The public
     /// functions only ever take one path, so each kernel is tested directly.
     fn kernels() -> Vec<(&'static str, Kernel, Kernel)> {
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
         let mut kernels: Vec<(&'static str, Kernel, Kernel)> =
             vec![("portable", dot_portable, l2_squared_portable)];
         #[cfg(target_arch = "x86_64")]
