@@ -56,12 +56,15 @@ cargo run -p nearby-server --release
 Then create a collection, add points and search:
 
 ```sh
-curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \n  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
+curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \
+  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
 
-curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \n  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
+curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \
+  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
                   {"id": 3, "vector": [0.9, 0.1, 0]}]}'
 
-curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \n  -d '{"vector": [1, 0.05, 0], "k": 2}'
+curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \
+  -d '{"vector": [1, 0.05, 0], "k": 2}'
 # {"results":[{"id":1,"distance":0.0012476444},{"id":3,"distance":0.0018416047}]}
 ```
 
@@ -252,6 +255,20 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   memory allows, so only the 16-byte codes stay in the process. With SIFT1M
   loaded, the server process holds 856 MB for HNSW (was 1,370 MB, before
   vectors stopped being kept twice) and 80 MB for PQ (was 591 MB).
+- **Payloads and filters.** A point's payload lives in the id map and is
+  stored with its vector in the log, segments and snapshots. A filter is
+  checked as each candidate is reached, so the index keeps searching until
+  it finds `k` matches. HNSW walks through rejected points to reach matching
+  ones: recall stays high, but the more a filter rejects, the more of the
+  graph a search visits. SIFT1M, HNSW defaults, 200 queries:
+
+  | Filter keeps | recall@10 | Mean latency |
+  |---|---|---|
+  | every point (no filter) | 0.9700 | 0.31 ms |
+  | 10% | 0.9985 | 4.4 ms |
+  | 1% | 1.0000 | 33.7 ms |
+
+  At 1% a search costs about as much as an exact scan.
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 
@@ -523,16 +540,31 @@ requests and flushes every collection before exiting.
 | `PUT` | `/collections/{name}` | `{"dim": 128, "metric": "cosine", "index": {"type": "hnsw", "m": 16}}` | `201` and collection info |
 | `GET` | `/collections/{name}` | | collection info: config, point count, segments |
 | `DELETE` | `/collections/{name}` | | `204` |
-| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...]}]}` | `{"upserted": 1}` |
+| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...], "payload": {"lang": "en"}}]}` | `{"upserted": 1}` |
 | `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": 2}` |
-| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
-| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.12}]}` |
+| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
+| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.12, "payload": {...}}]}` |
 
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
   `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
   `ef_construction` and `ef_search`) or `{"type": "pq"}` (optionally with
-  `subspaces`, `training_points`, `rerank`, `lists` and `probe`). Names are 1 to 64 ASCII letters,
-  digits, `-` or `_`.
+  `subspaces`, `training_points`, `rerank`, `lists` and `probe`). Names are
+  1 to 64 ASCII letters, digits, `-` or `_`.
+- **Payloads** are optional JSON objects of booleans, numbers and strings,
+  up to 64 KiB encoded per point. Writing a point replaces its payload too;
+  writing it without one removes it. Search results include payloads only
+  with `"with_payload": true`.
+- **Filters** limit a search to points whose payload matches, and are
+  applied during the search, so `k` matching points still come back when
+  few match:
+
+  | Filter | Matches points whose payload |
+  |---|---|
+  | `{"field": "lang", "eq": "en"}` | has `lang` equal to `"en"` |
+  | `{"field": "lang", "in": ["en", "es"]}` | has `lang` equal to any of them |
+  | `{"field": "year", "gte": 2020, "lt": 2024}` | has a number `year` within every bound given (`gt`, `gte`, `lt`, `lte`) |
+  | `{"field": "lang", "exists": true}` | has a `lang` field (`false`: hasn't) |
+  | `{"and": [...]}`, `{"or": [...]}`, `{"not": {...}}` | matches all, any, or not the given filters |
 - **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
   for a missing collection or point, `409` for a name that's taken, `413`
   for a body over `max_body_bytes`, `422` for JSON of the wrong shape.

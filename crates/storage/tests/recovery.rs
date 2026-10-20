@@ -21,7 +21,7 @@ fn options() -> StoreOptions {
 fn reopen(dir: &Path) -> (CollectionStore, Points) {
     let mut points = Points::new();
     let store = CollectionStore::open(dir, options(), |op| match op {
-        Op::Upsert { id, vector } => {
+        Op::Upsert { id, vector, .. } => {
             points.insert(id, vector.to_vec());
         }
         Op::Delete { id } => {
@@ -61,6 +61,7 @@ fn random_histories_recover_exactly() {
                     .write(&[Op::Upsert {
                         id,
                         vector: &vector,
+                        payload: &[],
                     }])
                     .unwrap();
                 model.insert(id, vector);
@@ -92,6 +93,7 @@ fn a_batch_write_is_replayed_whole() {
         .map(|id| Op::Upsert {
             id,
             vector: &[1.0, 2.0, 3.0],
+            payload: &[],
         })
         .collect();
     store.write(&ops).unwrap();

@@ -7,12 +7,16 @@
 //! missing, stale or damaged snapshot just means a full rebuild.
 //!
 //! ```text
-//! magic "NBSNAP01", generation u64, slot count u64
+//! magic "NBSNAP02", generation u64, slot count u64
 //! for each slot: point id u64, live u8
+//! payload count u64, then by ascending point id: id u64, length u32, payload
 //! crc32 of the above u32
 //! the index, in its own self-checking format (see `IndexBackend::save`)
 //! ```
+//!
+//! A version 1 snapshot (`NBSNAP01`, from before payloads) counts as stale.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,12 +26,14 @@ use nearby_core::{Error, PointId, Result};
 
 use crate::backend::{self, IndexBackend};
 use crate::config::CollectionConfig;
+use crate::payload::{self, Payload};
 use crate::points::PointTable;
 
 /// The snapshot's file name inside a collection directory.
 const FILE_NAME: &str = "index.snapshot";
 
-const MAGIC: &[u8; 8] = b"NBSNAP01";
+const MAGIC: &[u8; 8] = b"NBSNAP02";
+const MAGIC_V1: &[u8; 8] = b"NBSNAP01";
 
 fn path(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
@@ -54,6 +60,15 @@ pub(crate) fn save(
         for (id, live) in points.slots() {
             header.write_all(&id.to_le_bytes())?;
             header.write_all(&[u8::from(live)])?;
+        }
+        let mut payloads: Vec<(&PointId, &Payload)> = points.payloads().iter().collect();
+        payloads.sort_unstable_by_key(|&(id, _)| *id);
+        header.write_all(&(payloads.len() as u64).to_le_bytes())?;
+        for (id, payload) in payloads {
+            let bytes = payload::encode(payload)?;
+            header.write_all(&id.to_le_bytes())?;
+            header.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            header.write_all(&bytes)?;
         }
         let crc = header.crc();
         w.write_all(&crc.to_le_bytes())?;
@@ -110,6 +125,9 @@ fn read(
     let mut header = CrcReader::new(r);
     let mut magic = [0; 8];
     read_exact(&mut header, &mut magic)?;
+    if &magic == MAGIC_V1 {
+        return Ok(None);
+    }
     if &magic != MAGIC {
         return Err(corrupt("not a snapshot"));
     }
@@ -127,6 +145,20 @@ fn read(
         read_exact(&mut header, &mut live)?;
         slots.push((id, live[0] != 0));
     }
+    let payload_count = read_u64(&mut header)?;
+    let mut payloads = HashMap::new();
+    for _ in 0..payload_count {
+        let id = read_u64(&mut header)?;
+        let len = read_u32(&mut header)? as usize;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| corrupt("payload too large"))?;
+        bytes.resize(len, 0);
+        read_exact(&mut header, &mut bytes)?;
+        let payload = payload::decode(&bytes)?.ok_or_else(|| corrupt("empty payload"))?;
+        payloads.insert(id, payload);
+    }
     let computed = header.crc();
     let mut r = header.into_inner();
     if read_u32(&mut r)? != computed {
@@ -140,7 +172,7 @@ fn read(
     else {
         return Ok(None);
     };
-    Ok(Some((PointTable::from_slots(&slots), index)))
+    Ok(Some((PointTable::from_slots(&slots, payloads), index)))
 }
 
 fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
@@ -174,6 +206,7 @@ mod tests {
     use super::*;
     use crate::backend::new_index;
     use crate::config::{HnswConfig, IndexConfig, PqConfig};
+    use crate::payload::Value;
 
     fn config() -> CollectionConfig {
         CollectionConfig {
@@ -189,7 +222,8 @@ mod tests {
         let mut index = new_index(&config(), 0, Path::new(".")).unwrap();
         let mut add = |points: &mut PointTable, id: PointId, x: f32| {
             let v = [x, x];
-            let slot = points.upsert(id);
+            let tag = Payload::from([("tag".to_owned(), Value::String(format!("{id}")))]);
+            let slot = points.upsert(id, (id == 1).then_some(tag));
             index
                 .insert_batch(&[(u64::from(slot), &v)], NonZeroUsize::MIN)
                 .unwrap();
@@ -213,6 +247,8 @@ mod tests {
         let slot = loaded.slot(2).unwrap();
         assert_eq!(loaded_index.vector(slot), &[20.0, 20.0]);
         assert_eq!(loaded.slot(4), None);
+        assert_eq!(loaded.payloads(), points.payloads(), "payloads come back");
+        assert!(loaded.payload(1).is_some());
         assert_eq!(
             loaded_index.search(&[1.0, 1.0], 6).unwrap(),
             index.search(&[1.0, 1.0], 6).unwrap()
@@ -297,7 +333,7 @@ mod tests {
         let batch: Vec<(PointId, &[f32])> = vectors
             .iter()
             .enumerate()
-            .map(|(i, v)| (u64::from(points.upsert(i as PointId)), &v[..]))
+            .map(|(i, v)| (u64::from(points.upsert(i as PointId, None)), &v[..]))
             .collect();
         index.insert_batch(&batch, NonZeroUsize::MIN).unwrap();
         points.delete(n - 1);
