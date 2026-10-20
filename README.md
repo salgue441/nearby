@@ -10,7 +10,7 @@ honest.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: stable, 2024 edition](https://img.shields.io/badge/rust-stable%20%C2%B7%202024%20edition-orange.svg)](rust-toolchain.toml)
-[![Status: experimental](https://img.shields.io/badge/status-experimental-yellow.svg)](#roadmap)
+![Status: experimental](https://img.shields.io/badge/status-experimental-yellow.svg)
 
 </div>
 
@@ -656,24 +656,6 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - **Commits** follow [Conventional Commits](https://www.conventionalcommits.org/)
   (`feat`, `fix`, `perf`, `test`, `docs`, ...). Each one builds and passes
   the full suite on its own, and `perf` commits record their measurements.
-
-## Roadmap
-
-- [x] Exact search (`FlatIndex`)
-- [x] HNSW approximate search
-- [x] SIMD distance kernels (AVX2 + FMA, runtime dispatch)
-- [x] Benchmark harness with recall, latency percentiles and `ef` sweeps
-- [x] Parallel HNSW construction
-- [x] Product quantization
-- [x] Engine: collections, id map, deduplication and deletes
-- [x] Storage: segments, write-ahead log and recovery
-- [x] Server network API
-- [x] IVF-PQ, PQ collections with exact re-ranking, and snapshots for HNSW and PQ
-- [x] Payloads and filtered search
-- [x] Batch search, Prometheus metrics, HTTPS and a Docker image
-
-Possible next steps: a payload index, so filters that match few points stop
-walking the HNSW graph (see the filter latencies above); and replication.
 
 ## License
 
