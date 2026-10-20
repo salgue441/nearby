@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use nearby_core::{Error, PointId, Result};
 
 use crate::codec::{PutLe, Reader};
-use crate::crc::crc32;
 use crate::fsio::sync_dir;
+use nearby_core::checksum::crc32;
 
 const TAG_UPSERT: u8 = 1;
 const TAG_DELETE: u8 = 2;

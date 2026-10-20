@@ -18,7 +18,6 @@
 //! rebuilt from the replayed ops by whoever opens it.
 
 mod codec;
-mod crc;
 mod fsio;
 mod manifest;
 mod segment;

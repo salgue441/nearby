@@ -2,6 +2,7 @@
 //!
 //! Keep this crate small: only put code here when two or more crates need it.
 
+pub mod checksum;
 pub mod distance;
 mod error;
 mod topk;

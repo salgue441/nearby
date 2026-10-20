@@ -22,9 +22,9 @@ use std::path::Path;
 use nearby_core::{Error, PointId, Result};
 
 use crate::codec::{PutLe, Reader};
-use crate::crc::crc32;
 use crate::fsio::atomic_write;
 use crate::wal::Op;
+use nearby_core::checksum::crc32;
 
 const MAGIC: &[u8; 8] = b"NBSEG001";
 
