@@ -135,12 +135,17 @@ impl VectorIndex for PqIndex {
         self.ids.len()
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: &dyn Fn(PointId) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.quantizer.dim())?;
         let table = self.quantizer.distance_table(query);
         let mut top = TopK::new(k);
         let codes = self.codes.chunks_exact(self.quantizer.code_len());
-        for (code, &id) in codes.zip(&self.ids) {
+        for (code, &id) in codes.zip(&self.ids).filter(|&(_, &id)| keep(id)) {
             top.push(id, table.distance(code));
         }
         Ok(top.into_sorted())

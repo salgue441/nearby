@@ -89,6 +89,24 @@ impl<'a> SearchCtx<'a> {
         level: usize,
         visited: &mut VisitedSet,
     ) -> Vec<Neighbor> {
+        self.search_layer_filtered(query, entry_points, ef, level, visited, |_| true)
+    }
+
+    /// [`SearchCtx::search_layer`], returning only nodes `admit` accepts.
+    ///
+    /// Rejected nodes still guide the search: they are explored like any
+    /// other node that could lead closer, they just never enter the results.
+    /// So the result may be empty, and the more nodes are rejected, the more
+    /// of the graph a search explores before it has `ef` results.
+    pub(super) fn search_layer_filtered(
+        &self,
+        query: &Query<'_>,
+        entry_points: &[Neighbor],
+        ef: usize,
+        level: usize,
+        visited: &mut VisitedSet,
+        admit: impl Fn(u32) -> bool,
+    ) -> Vec<Neighbor> {
         visited.reset(self.store.len());
         // What to explore next: a min-heap, so the closest unexplored node pops first.
         let mut candidates = BinaryHeap::new();
@@ -98,7 +116,9 @@ impl<'a> SearchCtx<'a> {
         for ep in entry_points {
             visited.insert(ep.node);
             candidates.push(Reverse((OrdF32(ep.distance), ep.node)));
-            results.push(u64::from(ep.node), ep.distance);
+            if admit(ep.node) {
+                results.push(u64::from(ep.node), ep.distance);
+            }
         }
 
         while let Some(Reverse((OrdF32(distance), node))) = candidates.pop() {
@@ -120,8 +140,18 @@ impl<'a> SearchCtx<'a> {
                     continue;
                 }
                 let n = self.neighbor(query, next);
-                // `push` keeps `n` only if it beats the current worst (or there's room).
-                if results.push(u64::from(n.node), n.distance) {
+                // Only a node that could enter the results is worth exploring;
+                // checking that first keeps `admit` off the common path.
+                if results.is_full() && results.worst().is_some_and(|worst| n.distance > worst) {
+                    continue;
+                }
+                let promising = if admit(n.node) {
+                    // `push` keeps `n` only if it beats the current worst (or there's room).
+                    results.push(u64::from(n.node), n.distance)
+                } else {
+                    !results.is_full() || results.worst().is_some_and(|worst| n.distance < worst)
+                };
+                if promising {
                     candidates.push(Reverse((OrdF32(n.distance), n.node)));
                 }
             }
@@ -295,6 +325,24 @@ mod tests {
 
         let found = ctx.search_layer(&query, &[start], 10, 0, &mut visited);
         assert_eq!(nodes(&found), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn filtered_search_walks_through_rejected_nodes() {
+        // Nodes 1 to 3 are rejected, but the only way from 0 to 4 runs through them.
+        let (store, graph) = line();
+        let ctx = ctx(&store, &graph);
+        let mut visited = VisitedSet::default();
+        let query = ctx.query(&[3.9, 0.0]);
+        let start = ctx.neighbor(&query, 0);
+
+        let found = ctx.search_layer_filtered(&query, &[start], 2, 0, &mut visited, |n| {
+            !(1..=3).contains(&n)
+        });
+        assert_eq!(nodes(&found), vec![4, 0]);
+
+        let none = ctx.search_layer_filtered(&query, &[start], 2, 0, &mut visited, |_| false);
+        assert_eq!(none, Vec::new());
     }
 
     #[test]
