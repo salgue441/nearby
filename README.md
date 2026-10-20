@@ -594,11 +594,14 @@ requests and flushes every collection before exiting.
 - **Authentication.** Set `api_key` under `[server]`, or the `NEARBY_API_KEY`
   environment variable, and every endpoint but `/health` requires
   `Authorization: Bearer <key>`, answering `401` without it.
+- **HTTPS.** Set `tls_cert` and `tls_key` under `[server]` to PEM files (a
+  certificate chain and its private key) and the server speaks only HTTPS,
+  with rustls. Or leave them out and terminate TLS in a proxy in front.
 
 > [!WARNING]
 > Without an API key, every request is accepted. The server listens on
-> `127.0.0.1` by default; set a key, and terminate TLS in front of it (the
-> key travels in a header), before exposing it on a network.
+> `127.0.0.1` by default; set a key, and serve HTTPS (the key travels in a
+> header), before exposing it on a network.
 
 <details>
 <summary><b>Every configuration key and its default</b></summary>
@@ -610,6 +613,8 @@ data_dir = "./data"
 listen = "127.0.0.1:7700"
 max_body_bytes = 67108864 # 64 MiB
 # api_key = "..."        # require "Authorization: Bearer <key>"; NEARBY_API_KEY overrides it
+# tls_cert = "cert.pem"  # serve HTTPS with this PEM certificate chain...
+# tls_key = "key.pem"    # ...and this PEM private key (both or neither)
 
 [engine]
 durability = "sync"       # "sync": every write is on disk before it's acknowledged
@@ -663,8 +668,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] Engine: collections, id map, deduplication and deletes
 - [x] Storage: segments, write-ahead log and recovery
 - [x] Server network API
+- [x] IVF-PQ, PQ collections with exact re-ranking, and snapshots for HNSW and PQ
+- [x] Payloads and filtered search
+- [x] Batch search, Prometheus metrics, HTTPS and a Docker image
 
-Possible next steps: metadata filters on search.
+Possible next steps: a payload index, so filters that match few points stop
+walking the HNSW graph (see the filter latencies above); and replication.
 
 ## License
 
