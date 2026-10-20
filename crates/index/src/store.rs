@@ -36,6 +36,21 @@ impl VectorStore {
         self.data.len() / self.dim
     }
 
+    /// A store holding `data`, whose length must be a multiple of `dim`.
+    pub(crate) fn from_vec(dim: usize, data: Vec<f32>) -> Self {
+        assert!(dim > 0, "dimension must be at least 1");
+        assert!(
+            data.len().is_multiple_of(dim),
+            "data must hold whole vectors"
+        );
+        Self { dim, data }
+    }
+
+    /// Every vector, back to back.
+    pub(crate) fn as_slice(&self) -> &[f32] {
+        &self.data
+    }
+
     /// Appends a vector. Its internal id is the previous `len()`.
     pub(crate) fn push(&mut self, vector: &[f32]) {
         debug_assert_eq!(vector.len(), self.dim, "caller must validate the vector");

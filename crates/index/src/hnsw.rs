@@ -11,6 +11,7 @@
 mod graph;
 mod insert;
 mod params;
+mod persist;
 mod search;
 mod visited;
 
@@ -145,6 +146,14 @@ impl Hnsw {
     /// The top layer of the graph (0 when every node is on layer 0 only).
     pub fn max_level(&self) -> usize {
         self.max_level
+    }
+
+    /// Every point as `(id, vector)`, in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
+        self.ids
+            .iter()
+            .enumerate()
+            .map(|(node, &id)| (id, self.store.get(node)))
     }
 
     /// Changes the recall/speed trade-off for later searches. No rebuild needed.
@@ -603,6 +612,16 @@ mod tests {
         index.insert(7, &[1.0]).unwrap();
         assert_eq!(index.entry_point, Some(0));
         assert_eq!(index.max_level, index.graph.level(0));
+    }
+
+    #[test]
+    fn iter_yields_points_in_insertion_order() {
+        let index = grid_index();
+        let points: Vec<(PointId, Vec<f32>)> =
+            index.iter().map(|(id, v)| (id, v.to_vec())).collect();
+        assert_eq!(points.len(), 100);
+        assert_eq!(points[0], (0, vec![0.0, 0.0]));
+        assert_eq!(points[23], (23, vec![3.0, 2.0]));
     }
 
     #[test]
