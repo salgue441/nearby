@@ -22,6 +22,8 @@ mod backend;
 mod collection;
 mod config;
 mod database;
+mod filter;
+mod payload;
 mod points;
 mod pq;
 mod snapshot;
@@ -32,7 +34,9 @@ use std::num::NonZeroUsize;
 pub use collection::{Collection, CollectionInfo};
 pub use config::{CollectionConfig, HnswConfig, IndexConfig, PqConfig};
 pub use database::{CollectionHandle, Database};
+pub use filter::{Filter, Range};
 pub use nearby_storage::Durability;
+pub use payload::{MAX_PAYLOAD_BYTES, Payload, Value};
 
 /// Settings shared by every collection in a [`Database`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
