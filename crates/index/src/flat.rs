@@ -115,6 +115,12 @@ impl FlatIndex {
         Some(&self.data[start..start + self.dim])
     }
 
+    /// The `position`-th vector added, counting from 0.
+    pub fn vector_at(&self, position: usize) -> Option<&[f32]> {
+        let start = position.checked_mul(self.dim)?;
+        self.data.get(start..start + self.dim)
+    }
+
     /// Every vector as `(id, vector)`, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
         self.ids
@@ -248,6 +254,8 @@ mod tests {
         let points: Vec<(PointId, &[f32])> = index.iter().collect();
         assert_eq!(points.len(), 5);
         assert_eq!(points[3], (3, &[3.0, 0.0][..]));
+        assert_eq!(index.vector_at(3), Some(&[3.0, 0.0][..]));
+        assert_eq!(index.vector_at(5), None);
     }
 
     #[test]

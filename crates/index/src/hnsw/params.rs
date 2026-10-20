@@ -53,7 +53,7 @@ impl HnswParams {
     ///
     /// [`Error::InvalidParameter`] if `m < 2`, `m0` is outside `m..=1024`,
     /// or `ef_construction` or `ef_search` is 0.
-    pub(super) fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.m < 2 {
             return invalid(format!("m must be at least 2, got {}", self.m));
         }
