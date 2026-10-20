@@ -32,6 +32,9 @@ benchmark harness that keeps every optimization honest.
 - **Parallel, deterministic builds.** `insert_batch` links vectors on every
   core (3.6× faster on SIFT1M with 16 threads) and builds the same graph
   whatever the thread count.
+- **Compressed vectors.** `PqIndex` stores each 128-d vector in 16 bytes
+  (32× smaller) with product quantization, searched through per-query lookup
+  tables.
 - **Reproducible by design.** Seeded graph construction, deterministic tie
   breaking, and identical results across runs on a given machine.
 - **Measured, not guessed.** Every optimization in the history comes with
@@ -128,7 +131,7 @@ graph TD
 | Crate | Responsibility |
 |---|---|
 | `nearby-core` | Shared types (`PointId`, `Metric`, `ScoredPoint`), the error type, distance kernels and the `TopK` collector. |
-| `nearby-index` | The `VectorIndex` trait, `FlatIndex` and `Hnsw`. |
+| `nearby-index` | The `VectorIndex` trait, `FlatIndex`, `Hnsw` and `PqIndex` (product quantization). |
 | `nearby-engine` | *Planned.* Collections, the id map and query execution. |
 | `nearby-storage` | *Planned.* Segments, the write-ahead log and recovery. |
 | `nearby-server` | Configuration and logging. The network API is not implemented yet. |
@@ -220,6 +223,48 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 </details>
 
 <details>
+<summary><b>Compressed search: <code>PqIndex</code></b></summary>
+
+`PqIndex` implements product quantization (Jégou, Douze & Schmid, 2011).
+Each vector is split into `subspaces` equal slices, and each slice is replaced
+by the index of its nearest centroid among 256: one byte. A 128-d vector of
+512 bytes becomes 16 bytes with 16 subspaces.
+
+```rust
+let pq = ProductQuantizer::train(dim, Metric::L2, &PqParams::default(), &training, threads)?;
+let mut index = PqIndex::new(pq);
+index.add_batch(&points, threads)?;
+```
+
+- **Training** runs k-means per subspace: k-means++ seeding, then Lloyd
+  iterations until nothing moves or `iterations` is reached. An empty
+  cluster restarts at the point farthest from its centroid. Subspaces train
+  in parallel, and the codebooks depend only on the data and `seed`.
+- **Searching** never decodes a vector. The query is measured against every
+  centroid once, filling a `subspaces × 256` table; each stored vector then
+  costs one lookup per subspace, summed into four independent accumulators.
+- **Metrics.** L2 and dot product are approximated directly; cosine works on
+  normalized vectors.
+- Only codes and ids are stored, so results can't be re-ranked with exact
+  distances yet.
+
+SIFT1M, 100k training vectors, 10k queries, 16 threads:
+
+| Index | Bytes/vector | Recall@10 | Mean latency | Train + encode |
+|---|---:|---:|---:|---:|
+| `FlatIndex` | 512 | 0.9994 | 30.4 ms | – |
+| `PqIndex`, 16 subspaces | 16 | 0.5452 | 7.4 ms | 7.7 s + 6.2 s |
+| `PqIndex`, 32 subspaces | 32 | 0.7215 | 14.4 ms | 9.9 s + 8.8 s |
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `subspaces` | 16 | Code bytes per vector; must divide the dimension. More: better recall, more memory, slower searches. |
+| `iterations` | 25 | Maximum k-means iterations per subspace. |
+| `seed` | `0x5EED` | Seed for k-means++ seeding. |
+
+</details>
+
+<details>
 <summary><b>Distance kernels</b></summary>
 
 `dot` and `l2_squared`, and everything built on them, pick a kernel at
@@ -278,11 +323,13 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | Option | Default | Meaning |
 |---|---|---|
 | `DATASET_DIR` | `data/siftsmall` | Dataset directory. |
-| `--index flat\|hnsw\|both` | `both` | Which indexes to build and query. |
+| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. ||hnsw\|both` | `both` | Which indexes to build and query. |
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
-| `--threads N` | all available | Threads that build the HNSW index (`insert_batch`). The graph is the same for any value. |
+| `--pq-subspaces N` | `16` | PQ code bytes per vector. Must divide the dimension. |
+| `--pq-train N` | `100000` | Base vectors, from the front of the file, that PQ is trained on. |
+| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ. Results are the same for any value. |
 | `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, one result row each. Values below `k` run as `k`, and each row is labeled with the `ef` it actually used. |
 | `-h`, `--help` | | Print usage. |
 
@@ -379,7 +426,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] SIMD distance kernels (AVX2 + FMA, runtime dispatch)
 - [x] Benchmark harness with recall, latency percentiles and `ef` sweeps
 - [x] Parallel HNSW construction
-- [ ] Product quantization
+- [x] Product quantization
 - [ ] Engine: collections, id map, deduplication and deletes
 - [ ] Storage: segments, write-ahead log and recovery
 - [ ] Server network API

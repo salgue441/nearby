@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use nearby_core::{Metric, PointId};
-use nearby_index::{FlatIndex, Hnsw, HnswParams, VectorIndex};
+use nearby_index::{FlatIndex, Hnsw, HnswParams, PqIndex, PqParams, ProductQuantizer, VectorIndex};
 
 use crate::dataset::{Dataset, Vectors};
 use crate::metrics::{LatencyStats, recall_at_k};
@@ -26,13 +26,16 @@ const USAGE: &str = "\
 usage: nearby-bench [DATASET_DIR] [OPTIONS]
 
   DATASET_DIR              default: data/siftsmall
-  --index flat|hnsw|both   which index to benchmark (default: both)
+  --index LIST             indexes to benchmark, comma-separated: flat, hnsw, pq,
+                           or `both` (flat,hnsw) or `all` (default: both)
   --k N                    neighbors per query (default: 10)
   --m N                    HNSW links per node (default: 16)
   --ef-construction N      HNSW build quality (default: 200)
-  --threads N              threads that build HNSW (default: all available)
   --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)
-                           (a search uses at least k, so smaller values run as k)";
+                           (a search uses at least k, so smaller values run as k)
+  --pq-subspaces N         PQ code bytes per vector; must divide the dimension (default: 16)
+  --pq-train N             base vectors PQ is trained on (default: 100000)
+  --threads N              threads that build HNSW and PQ (default: all available)";
 
 /// Base vectors read from disk at a time while building. Small enough to
 /// add no meaningful memory, large enough that timing each chunk is cheap.
@@ -40,25 +43,69 @@ const BUILD_CHUNK: usize = 4096;
 
 /// Which indexes to build and query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IndexChoice {
-    Flat,
-    Hnsw,
-    Both,
+struct IndexSet {
+    flat: bool,
+    hnsw: bool,
+    pq: bool,
+}
+
+impl IndexSet {
+    /// The default: the exact index and HNSW.
+    const BOTH: Self = Self {
+        flat: true,
+        hnsw: true,
+        pq: false,
+    };
+
+    /// Parses an `--index` value: a comma-separated list of `flat`, `hnsw`,
+    /// `pq`, `both` (flat and hnsw) and `all`.
+    ///
+    /// # Errors
+    ///
+    /// On an unknown name, including an empty one.
+    fn parse(list: &str) -> anyhow::Result<Self> {
+        let mut set = Self {
+            flat: false,
+            hnsw: false,
+            pq: false,
+        };
+        for name in list.split(',').map(str::trim) {
+            match name {
+                "flat" => set.flat = true,
+                "hnsw" => set.hnsw = true,
+                "pq" => set.pq = true,
+                "both" => (set.flat, set.hnsw) = (true, true),
+                "all" => (set.flat, set.hnsw, set.pq) = (true, true, true),
+                other => bail!(
+                    "unknown index `{other}`
+
+{USAGE}"
+                ),
+            }
+        }
+        Ok(set)
+    }
 }
 
 /// Parsed command line. See [`USAGE`] for each option's meaning and default.
 #[derive(Debug, PartialEq)]
 struct Args {
     dir: PathBuf,
-    index: IndexChoice,
+    indexes: IndexSet,
     k: usize,
     m: usize,
     ef_construction: usize,
-    /// Threads that build the HNSW index.
-    threads: NonZeroUsize,
-    /// One result row is reported per value.
+    /// One HNSW result row is reported per value.
     ef_search: Vec<usize>,
+    pq_subspaces: usize,
+    /// How many base vectors, from the front of the file, train PQ.
+    pq_train: usize,
+    /// Threads that build the HNSW and PQ indexes.
+    threads: NonZeroUsize,
 }
+
+/// One line of the results table: a label, the mean recall@k and latencies.
+type Row = (String, (f64, LatencyStats));
 
 fn main() -> anyhow::Result<()> {
     let Some(args) = parse_args(std::env::args().skip(1))? else {
@@ -66,68 +113,122 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     let data = Dataset::load(&args.dir, args.k)?;
-    let (dim, len) = (data.dim(), data.base_len());
     println!(
-        "dataset  {}: {len} base vectors, {} queries, dim {dim}\n",
+        "dataset  {}: {} base vectors, {} queries, dim {}\n",
         data.name,
+        data.base_len(),
         data.queries.len(),
+        data.dim(),
     );
 
     // Each index is built from its own pass over the base file, queried, and
     // dropped before the next one is built, so peak memory is that of the
     // largest single index.
     let mut rows = Vec::new();
+    if args.indexes.flat {
+        rows.extend(bench_flat(&data, &args)?);
+    }
+    if args.indexes.hnsw {
+        rows.extend(bench_hnsw(&data, &args)?);
+    }
+    if args.indexes.pq {
+        rows.extend(bench_pq(&data, &args)?);
+    }
+    print_rows(&rows, args.k);
+    Ok(())
+}
 
-    if args.index != IndexChoice::Hnsw {
-        let mut flat = FlatIndex::with_capacity(dim, Metric::L2, len);
-        let build_time = build(&data, |batch| {
-            batch
-                .iter()
-                .try_for_each(|&(id, vector)| flat.add(id, vector))
-        })?;
-        println!("build    flat: {build_time:.2?}");
+/// Builds and queries the exact index.
+fn bench_flat(data: &Dataset, args: &Args) -> anyhow::Result<Vec<Row>> {
+    let mut flat = FlatIndex::with_capacity(data.dim(), Metric::L2, data.base_len());
+    let build_time = build(data, |batch| {
+        batch
+            .iter()
+            .try_for_each(|&(id, vector)| flat.add(id, vector))
+    })?;
+    println!("build    flat: {build_time:.2?}");
+    Ok(vec![(
+        "flat".to_owned(),
+        run_queries(&flat, &data.queries, &data.truth, args.k)?,
+    )])
+}
+
+/// Builds the HNSW index, then queries it once per `ef_search` value.
+fn bench_hnsw(data: &Dataset, args: &Args) -> anyhow::Result<Vec<Row>> {
+    let params = HnswParams {
+        m: args.m,
+        m0: 2 * args.m,
+        ef_construction: args.ef_construction,
+        ..HnswParams::default()
+    };
+    let mut hnsw = Hnsw::with_capacity(data.dim(), Metric::L2, params, data.base_len())?;
+    let build_time = build(data, |batch| hnsw.insert_batch(batch, args.threads))?;
+    println!(
+        "build    hnsw (m={}, ef_construction={}, threads={}): {build_time:.2?}, {} layers",
+        args.m,
+        args.ef_construction,
+        args.threads,
+        hnsw.max_level() + 1
+    );
+    let sweep = effective_ef(&args.ef_search, args.k);
+    if sweep != args.ef_search {
+        println!(
+            "note     a search uses ef >= k, so values below k = {} run as {}",
+            args.k, args.k
+        );
+    }
+    let mut rows = Vec::with_capacity(sweep.len());
+    for ef in sweep {
+        hnsw.set_ef_search(ef);
         rows.push((
-            "flat".to_owned(),
-            run_queries(&flat, &data.queries, &data.truth, args.k)?,
+            format!("hnsw ef={ef}"),
+            run_queries(&hnsw, &data.queries, &data.truth, args.k)?,
         ));
     }
+    Ok(rows)
+}
 
-    if args.index != IndexChoice::Flat {
-        let params = HnswParams {
-            m: args.m,
-            m0: 2 * args.m,
-            ef_construction: args.ef_construction,
-            ..HnswParams::default()
-        };
-        let mut hnsw = Hnsw::with_capacity(dim, Metric::L2, params, len)?;
-        let build_time = build(&data, |batch| hnsw.insert_batch(batch, args.threads))?;
-        println!(
-            "build    hnsw (m={}, ef_construction={}, threads={}): {build_time:.2?}, {} layers",
-            args.m,
-            args.ef_construction,
-            args.threads,
-            hnsw.max_level() + 1
-        );
-        let sweep = effective_ef(&args.ef_search, args.k);
-        if sweep != args.ef_search {
-            println!(
-                "note     a search uses ef >= k, so values below k = {} run as {}",
-                args.k, args.k
-            );
-        }
-        for ef in sweep {
-            hnsw.set_ef_search(ef);
-            rows.push((
-                format!("hnsw ef={ef}"),
-                run_queries(&hnsw, &data.queries, &data.truth, args.k)?,
-            ));
-        }
-    }
+/// Trains a product quantizer on the front of the base file, encodes every
+/// base vector with it, and queries the codes.
+fn bench_pq(data: &Dataset, args: &Args) -> anyhow::Result<Vec<Row>> {
+    let training = data.read_base_prefix(args.pq_train)?;
+    let params = PqParams {
+        subspaces: args.pq_subspaces,
+        ..PqParams::default()
+    };
+    let start = Instant::now();
+    let quantizer = ProductQuantizer::train(
+        data.dim(),
+        Metric::L2,
+        &params,
+        &training.data,
+        args.threads,
+    )?;
+    let train_time = start.elapsed();
+    let training_len = training.len();
+    drop(training);
 
+    let mut pq = PqIndex::with_capacity(quantizer, data.base_len());
+    let encode_time = build(data, |batch| pq.add_batch(batch, args.threads))?;
+    println!(
+        "build    pq (subspaces={}, threads={}): train {train_time:.2?} on {training_len} vectors, \
+         encode {encode_time:.2?}, {} bytes/vector",
+        args.pq_subspaces,
+        args.threads,
+        pq.bytes_per_vector()
+    );
+    Ok(vec![(
+        "pq".to_owned(),
+        run_queries(&pq, &data.queries, &data.truth, args.k)?,
+    )])
+}
+
+/// Prints the results table.
+fn print_rows(rows: &[Row], k: usize) {
     println!(
         "\n{:<14} {:>9} {:>9} {:>10} {:>10} {:>10} {:>10} {:>10}",
         "index",
-        format!("recall@{}", args.k),
+        format!("recall@{k}"),
         "qps",
         "mean",
         "p50",
@@ -135,7 +236,7 @@ fn main() -> anyhow::Result<()> {
         "p99",
         "max"
     );
-    for (label, (recall, stats)) in &rows {
+    for (label, (recall, stats)) in rows {
         println!(
             "{label:<14} {recall:>9.4} {:>9.0} {:>10} {:>10} {:>10} {:>10} {:>10}",
             stats.qps(),
@@ -146,7 +247,6 @@ fn main() -> anyhow::Result<()> {
             fmt_duration(stats.max)
         );
     }
-    Ok(())
 }
 
 /// Streams the base vectors into an index through `insert`, one chunk of
@@ -234,17 +334,19 @@ fn run_queries(
 /// # Errors
 ///
 /// On an unknown option or index, a missing or non-numeric value, `--k 0`,
-/// `--threads 0`, or an `--ef` list that is empty or contains 0. Errors about unknown or
-/// incomplete options include [`USAGE`].
+/// `--threads 0`, or an `--ef` list that is empty or contains 0. Errors
+/// about unknown or incomplete options include [`USAGE`].
 fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Args>> {
     let mut args = Args {
         dir: PathBuf::from("data/siftsmall"),
-        index: IndexChoice::Both,
+        indexes: IndexSet::BOTH,
         k: 10,
         m: 16,
         ef_construction: 200,
-        threads: default_threads(),
         ef_search: vec![10, 20, 40, 80, 160, 320],
+        pq_subspaces: 16,
+        pq_train: 100_000,
+        threads: default_threads(),
     };
     let mut it = raw.into_iter();
     while let Some(arg) = it.next() {
@@ -253,19 +355,14 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
                 .with_context(|| format!("{flag} needs a value\n\n{USAGE}"))
         };
         match arg.as_str() {
-            "--index" => {
-                args.index = match value("--index")?.as_str() {
-                    "flat" => IndexChoice::Flat,
-                    "hnsw" => IndexChoice::Hnsw,
-                    "both" => IndexChoice::Both,
-                    other => bail!("unknown index `{other}`\n\n{USAGE}"),
-                }
-            }
+            "--index" => args.indexes = IndexSet::parse(&value("--index")?)?,
             "--k" => args.k = parse_number(&value("--k")?)?,
             "--m" => args.m = parse_number(&value("--m")?)?,
             "--ef-construction" => {
                 args.ef_construction = parse_number(&value("--ef-construction")?)?;
             }
+            "--pq-subspaces" => args.pq_subspaces = parse_number(&value("--pq-subspaces")?)?,
+            "--pq-train" => args.pq_train = parse_number(&value("--pq-train")?)?,
             "--threads" => {
                 args.threads = NonZeroUsize::new(parse_number(&value("--threads")?)?)
                     .context("--threads must be at least 1")?;
@@ -321,12 +418,14 @@ mod tests {
             args,
             Args {
                 dir: PathBuf::from("data/siftsmall"),
-                index: IndexChoice::Both,
+                indexes: IndexSet::BOTH,
                 k: 10,
                 m: 16,
                 ef_construction: 200,
-                threads: default_threads(),
                 ef_search: vec![10, 20, 40, 80, 160, 320],
+                pq_subspaces: 16,
+                pq_train: 100_000,
+                threads: default_threads(),
             }
         );
     }
@@ -345,23 +444,56 @@ mod tests {
             "400",
             "--threads",
             "3",
+            "--pq-subspaces",
+            "32",
+            "--pq-train",
+            "5000",
             "--ef",
             "50, 100,200",
         ])
         .unwrap()
         .unwrap();
         assert_eq!(args.dir, PathBuf::from("data/sift"));
-        assert_eq!(args.index, IndexChoice::Hnsw);
+        assert_eq!(
+            args.indexes,
+            IndexSet {
+                flat: false,
+                hnsw: true,
+                pq: false
+            }
+        );
         assert_eq!((args.k, args.m, args.ef_construction), (100, 32, 400));
         assert_eq!(args.ef_search, vec![50, 100, 200]);
         assert_eq!(args.threads.get(), 3);
+        assert_eq!((args.pq_subspaces, args.pq_train), (32, 5000));
     }
 
     #[test]
     fn options_may_come_before_the_directory() {
         let args = parse(&["--index", "flat", "data/gist"]).unwrap().unwrap();
         assert_eq!(args.dir, PathBuf::from("data/gist"));
-        assert_eq!(args.index, IndexChoice::Flat);
+        assert!(args.indexes.flat && !args.indexes.hnsw && !args.indexes.pq);
+    }
+
+    #[test]
+    fn index_lists_combine() {
+        let set = |list: &str| IndexSet::parse(list).unwrap();
+        let all = IndexSet {
+            flat: true,
+            hnsw: true,
+            pq: true,
+        };
+        assert_eq!(set("all"), all);
+        assert_eq!(set("pq, both"), all);
+        assert_eq!(set("both"), IndexSet::BOTH);
+        assert_eq!(
+            set("pq"),
+            IndexSet {
+                flat: false,
+                hnsw: false,
+                pq: true
+            }
+        );
     }
 
     #[test]
@@ -372,8 +504,10 @@ mod tests {
 
     #[test]
     fn errors_explain_the_problem() {
-        let cases: [(&[&str], &str); 9] = [
+        let cases: [(&[&str], &str); 11] = [
             (&["--index", "ivf"], "unknown index `ivf`"),
+            (&["--index", "flat,,pq"], "unknown index ``"),
+            (&["--pq-train"], "--pq-train needs a value"),
             (&["--frobnicate"], "unknown option `--frobnicate`"),
             (&["--k"], "--k needs a value"),
             (&["--k", "ten"], "`ten` is not"),
