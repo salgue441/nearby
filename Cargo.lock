@@ -750,6 +750,7 @@ version = "1.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0c168a474b95bfecfe908a65d4bdffc523144b649a74c09c286afb35d53e0bc"
 dependencies = [
+ "bytes",
  "libc",
  "mio",
  "pin-project-lite",
