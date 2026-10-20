@@ -53,6 +53,19 @@ Run the server (it stores data in `./data` and listens on `127.0.0.1:7700`):
 cargo run -p nearby-server --release
 ```
 
+Or with Docker, keeping the data in a volume (the image listens on every
+interface, so set an API key; `curl` then needs `-H 'Authorization: Bearer
+change-me'`):
+
+```sh
+docker build -t nearby .
+docker run -p 7700:7700 -v nearby-data:/data -e NEARBY_API_KEY=change-me nearby
+```
+
+The image's config is [`docker/nearby.toml`](docker/nearby.toml); mount
+another file over `/etc/nearby/nearby.toml` to change it. Logs go to stdout
+as JSON lines.
+
 Then create a collection, add points and search:
 
 ```sh
