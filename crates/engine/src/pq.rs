@@ -5,29 +5,28 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 
 use nearby_core::{Metric, PointId, Result, ScoredPoint};
-use nearby_index::{FlatIndex, PqIndex, PqParams, ProductQuantizer, VectorIndex};
+use nearby_index::{FlatIndex, IvfPqIndex, IvfPqParams, PqIndex, ProductQuantizer, VectorIndex};
 
 use crate::backend::IndexBackend;
 use crate::config::PqConfig;
 use crate::vectors::VectorFile;
 
-/// A [`PqIndex`] that trains itself once enough points have arrived.
+/// A PQ index that trains itself once enough points have arrived.
 ///
 /// A quantizer can't be trained before there is data, so points first go
 /// into a [`FlatIndex`] and are searched exactly. When the
-/// `training_points`-th point arrives, the quantizer is trained on the first
-/// `training_points` points, in insertion order, every point is encoded, and
-/// the flat index is dropped. Training on a fixed prefix keeps the result
-/// independent of how writes were batched.
+/// `training_points`-th point arrives, the quantizer (and, with `lists`, the
+/// clusters) are trained on the first `training_points` points, in
+/// insertion order, every point is encoded, and the flat index is dropped.
+/// Training on a fixed prefix keeps the result independent of how writes
+/// were batched.
 ///
 /// The full vectors, needed for re-ranking and lookups, go to a
 /// [`VectorFile`] on disk, so once trained only the codes stay in memory.
 #[derive(Debug)]
 pub(crate) struct PqBackend {
     metric: Metric,
-    params: PqParams,
-    training_points: usize,
-    rerank: NonZeroUsize,
+    config: PqConfig,
     state: State,
     vectors: VectorFile,
 }
@@ -36,7 +35,67 @@ pub(crate) struct PqBackend {
 enum State {
     /// Not enough points to train on yet.
     Collecting(FlatIndex),
-    Trained(PqIndex),
+    Trained(Codes),
+}
+
+/// Trained codes: scanned in full, or grouped into clusters.
+#[derive(Debug)]
+enum Codes {
+    Flat(PqIndex),
+    Ivf(IvfPqIndex),
+}
+
+impl Codes {
+    /// Trains on the first `config.training_points` vectors of `flat` and
+    /// encodes all of them.
+    fn train(
+        flat: &FlatIndex,
+        metric: Metric,
+        config: &PqConfig,
+        threads: NonZeroUsize,
+    ) -> Result<Self> {
+        let training: Vec<f32> = flat
+            .iter()
+            .take(config.training_points)
+            .flat_map(|(_, vector)| vector)
+            .copied()
+            .collect();
+        let mut codes = if config.lists == 0 {
+            let quantizer =
+                ProductQuantizer::train(flat.dim(), metric, &config.params(), &training, threads)?;
+            Self::Flat(PqIndex::with_capacity(quantizer, flat.len()))
+        } else {
+            let params = IvfPqParams {
+                pq: config.params(),
+                lists: config.lists,
+                probe: config.probe,
+            };
+            Self::Ivf(IvfPqIndex::train(
+                flat.dim(),
+                metric,
+                &params,
+                &training,
+                threads,
+            )?)
+        };
+        let points: Vec<(PointId, &[f32])> = flat.iter().collect();
+        codes.add_batch(&points, threads)?;
+        Ok(codes)
+    }
+
+    fn add_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()> {
+        match self {
+            Self::Flat(pq) => pq.add_batch(points, threads),
+            Self::Ivf(ivf) => ivf.add_batch(points, threads),
+        }
+    }
+
+    fn index(&self) -> &dyn VectorIndex {
+        match self {
+            Self::Flat(pq) => pq,
+            Self::Ivf(ivf) => ivf,
+        }
+    }
 }
 
 impl PqBackend {
@@ -51,9 +110,7 @@ impl PqBackend {
         Ok(Self {
             vectors: VectorFile::create(dir, dim)?,
             metric,
-            params: config.params(),
-            training_points: config.training_points,
-            rerank: NonZeroUsize::new(config.rerank).expect("validated above"),
+            config: config.clone(),
             state: State::Collecting(FlatIndex::new(dim, metric)),
         })
     }
@@ -64,32 +121,10 @@ impl PqBackend {
         matches!(self.state, State::Trained(_))
     }
 
-    /// Trains the quantizer on the first `training_points` collected points
-    /// and encodes all of them.
-    fn train(
-        flat: &FlatIndex,
-        metric: Metric,
-        params: &PqParams,
-        training_points: usize,
-        threads: NonZeroUsize,
-    ) -> Result<PqIndex> {
-        let training: Vec<f32> = flat
-            .iter()
-            .take(training_points)
-            .flat_map(|(_, vector)| vector)
-            .copied()
-            .collect();
-        let quantizer = ProductQuantizer::train(flat.dim(), metric, params, &training, threads)?;
-        let mut index = PqIndex::with_capacity(quantizer, flat.len());
-        let points: Vec<(PointId, &[f32])> = flat.iter().collect();
-        index.add_batch(&points, threads)?;
-        Ok(index)
-    }
-
     fn index(&self) -> &dyn VectorIndex {
         match &self.state {
             State::Collecting(flat) => flat,
-            State::Trained(pq) => pq,
+            State::Trained(codes) => codes.index(),
         }
     }
 }
@@ -118,22 +153,15 @@ impl IndexBackend for PqBackend {
         self.vectors
             .append(points.iter().map(|&(_, vector)| vector))?;
         match &mut self.state {
-            State::Trained(pq) => pq.add_batch(points, threads),
+            State::Trained(codes) => codes.add_batch(points, threads)?,
             State::Collecting(flat) => {
                 flat.insert_batch(points, threads)?;
-                if flat.len() >= self.training_points {
-                    let trained = Self::train(
-                        flat,
-                        self.metric,
-                        &self.params,
-                        self.training_points,
-                        threads,
-                    )?;
-                    self.state = State::Trained(trained);
+                if flat.len() >= self.config.training_points {
+                    let codes = Codes::train(flat, self.metric, &self.config, threads)?;
+                    self.state = State::Trained(codes);
                 }
-                Ok(())
             }
-        }?;
+        }
         debug_assert_eq!(self.vectors.len(), self.len(), "one vector per slot");
         Ok(())
     }
@@ -143,7 +171,8 @@ impl IndexBackend for PqBackend {
     }
 
     fn rerank(&self) -> Option<NonZeroUsize> {
-        matches!(self.state, State::Trained(_)).then_some(self.rerank)
+        let trained = matches!(self.state, State::Trained(_));
+        trained.then(|| NonZeroUsize::new(self.config.rerank).expect("validated in new"))
     }
 }
 
@@ -158,6 +187,8 @@ mod tests {
             subspaces: 4,
             training_points,
             rerank: 3,
+            lists: 0,
+            probe: 1,
         }
     }
 
@@ -228,6 +259,28 @@ mod tests {
             assert_eq!(
                 whole.search(query, 10).unwrap(),
                 pieces.search(query, 10).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn clusters_probed_in_full_match_a_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = points(1_000);
+        let mut full = PqBackend::new(DIM, Metric::L2, &config(300), dir.path()).unwrap();
+        insert(&mut full, &data, 1_000);
+        let clustered = PqConfig {
+            lists: 8,
+            probe: 8,
+            ..config(300)
+        };
+        let mut ivf = PqBackend::new(DIM, Metric::L2, &clustered, dir.path()).unwrap();
+        insert(&mut ivf, &data, 250);
+        assert!(matches!(ivf.state, State::Trained(Codes::Ivf(_))));
+        for query in data.as_chunks::<DIM>().0.iter().step_by(50) {
+            assert_eq!(
+                full.search(query, 10).unwrap(),
+                ivf.search(query, 10).unwrap()
             );
         }
     }

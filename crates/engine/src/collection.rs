@@ -483,6 +483,8 @@ mod tests {
                 subspaces: 2,
                 training_points: 256,
                 rerank: 2,
+                lists: 0,
+                probe: 1,
             }),
         ]
     }
@@ -590,6 +592,8 @@ mod tests {
             subspaces: 2,
             training_points: 256,
             rerank: 2,
+            lists: 0,
+            probe: 1,
         });
         let mut c = Collection::create(dir.path(), "c", config(pq), options()).unwrap();
         let points: Vec<(PointId, [f32; 2])> =
@@ -746,11 +750,24 @@ mod tests {
 
     #[test]
     fn pq_collections_rerank_with_exact_distances() {
+        check_pq_collection(0, 1);
+    }
+
+    #[test]
+    fn ivf_pq_collections_rerank_with_exact_distances() {
+        check_pq_collection(16, 4);
+    }
+
+    /// Writes, searches, replaces, deletes and reopens a PQ collection
+    /// with the given clustering.
+    fn check_pq_collection(lists: usize, probe: usize) {
         let dir = tempfile::tempdir().unwrap();
         let pq = IndexConfig::Pq(PqConfig {
             subspaces: 4,
             training_points: 500,
             rerank: 10,
+            lists,
+            probe,
         });
         let config = CollectionConfig {
             dim: 8,

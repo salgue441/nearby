@@ -82,8 +82,10 @@ impl HnswConfig {
 /// Until `training_points` points have been written, searches are exact.
 /// The quantizer is then trained on those points, every point is encoded,
 /// and from then on a search scans the codes for `rerank * k` candidates and
-/// returns the best `k` by exact distance. The quantizer is retrained
-/// whenever the index is rebuilt: on open, and after many deletes.
+/// returns the best `k` by exact distance. With `lists`, the codes are also
+/// grouped into that many clusters (IVF-PQ), and a search scans only the
+/// `probe` clusters nearest the query. The quantizer is retrained whenever
+/// the index is rebuilt: on open, and after many deletes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PqConfig {
@@ -96,6 +98,12 @@ pub struct PqConfig {
     /// Candidates fetched per requested result and re-ranked by exact
     /// distance. At least 1. Default: 10.
     pub rerank: usize,
+    /// Clusters the codes are grouped into, at most `training_points`; 0
+    /// scans every code instead. Default: 256.
+    pub lists: usize,
+    /// Clusters a search scans when `lists` is set, nearest first. At least
+    /// 1. Default: 16.
+    pub probe: usize,
 }
 
 impl Default for PqConfig {
@@ -104,6 +112,8 @@ impl Default for PqConfig {
             subspaces: PqParams::default().subspaces,
             training_points: 10_000,
             rerank: 10,
+            lists: 256,
+            probe: 16,
         }
     }
 }
@@ -119,7 +129,8 @@ impl PqConfig {
     /// # Errors
     ///
     /// [`Error::InvalidParameter`] if `subspaces` doesn't divide `dim`,
-    /// `training_points` is below 256, or `rerank` is 0.
+    /// `training_points` is below 256, `rerank` or `probe` is 0, or `lists`
+    /// exceeds `training_points`.
     pub fn validate(&self, dim: usize) -> Result<()> {
         self.params().validate(dim)?;
         if self.training_points < ProductQuantizer::MIN_TRAINING {
@@ -132,6 +143,17 @@ impl PqConfig {
         if self.rerank == 0 {
             return Err(Error::InvalidParameter(
                 "rerank must be at least 1".to_owned(),
+            ));
+        }
+        if self.lists > self.training_points {
+            return Err(Error::InvalidParameter(format!(
+                "lists must be at most training_points ({}), got {}",
+                self.training_points, self.lists
+            )));
+        }
+        if self.probe == 0 {
+            return Err(Error::InvalidParameter(
+                "probe must be at least 1".to_owned(),
             ));
         }
         Ok(())
@@ -219,9 +241,16 @@ mod tests {
         let IndexConfig::Pq(pq) = &config.index else {
             panic!("expected pq");
         };
+        let defaults = PqConfig::default();
+        assert_eq!(pq.subspaces, 8);
         assert_eq!(
-            (pq.subspaces, pq.training_points, pq.rerank),
-            (8, 10_000, 10)
+            (pq.training_points, pq.rerank, pq.lists, pq.probe),
+            (
+                defaults.training_points,
+                defaults.rerank,
+                defaults.lists,
+                defaults.probe
+            )
         );
         assert!(pq.validate(config.dim).is_ok());
     }
@@ -245,6 +274,22 @@ mod tests {
                 },
                 16,
                 "rerank",
+            ),
+            (
+                PqConfig {
+                    lists: 20_000,
+                    ..PqConfig::default()
+                },
+                16,
+                "lists must be at most training_points",
+            ),
+            (
+                PqConfig {
+                    probe: 0,
+                    ..PqConfig::default()
+                },
+                16,
+                "probe must be at least 1",
             ),
         ];
         for (pq, dim, expected) in cases {
