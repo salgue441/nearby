@@ -17,8 +17,10 @@ nearby-engine  = { path = "crates/engine" }
 # External: versions are set once, here
 anyhow = "1"
 axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 http-body-util = "0.1"
 memmap2 = "0.9"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -29,6 +31,7 @@ tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
