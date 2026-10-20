@@ -198,7 +198,7 @@ data/collections/docs/
 <summary><b>Collections: <code>nearby-engine</code></b></summary>
 
 A `Database` holds named collections, each with a fixed dimension, metric and
-index (`flat` or `hnsw`, with its parameters).
+index (`flat`, `hnsw` or `pq`, with its parameters).
 
 - **Ids** are chosen by the caller. Writing an existing id replaces the point.
 - **Deletes and replacements.** Indexes only append, so an old vector stays
@@ -212,6 +212,26 @@ index (`flat` or `hnsw`, with its parameters).
   otherwise (a crash after a flush, a damaged file) the index is rebuilt
   from storage. On SIFT1M, a restart takes 1.8 s instead of 87 s (the
   snapshot is 591 MB and takes 1.7 s to write).
+- **PQ collections.** A quantizer needs data to train on, so a `pq`
+  collection searches exactly until `training_points` points (default
+  10,000) have been written, then trains on them and encodes every point.
+  Each search then scans the codes for `rerank * k` candidates (default
+  `rerank = 10`) and returns the best `k` by exact distance, using the
+  full vectors the engine keeps anyway. On SIFT1M with 16 subspaces:
+
+  | `rerank` | recall@10 |
+  |---|---|
+  | 1 (codes only) | 0.5310 |
+  | 5 | 0.8984 |
+  | 10 (default) | 0.9654 |
+  | 20 | 0.9906 |
+  | 50 | 0.9984 |
+
+  Searches take about 10 ms either way, since scanning a million codes
+  dominates. Loading the million points takes 15 s (HNSW: 90 s), and a PQ
+  collection isn't snapshotted: each start retrains, which takes 6 s here.
+  HNSW searches are much faster, so PQ is for when build time or index
+  memory matters more than latency.
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 
@@ -403,7 +423,7 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | Option | Default | Meaning |
 |---|---|---|
 | `DATASET_DIR` | `data/siftsmall` | Dataset directory. |
-| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. ||hnsw\|both` | `both` | Which indexes to build and query. |
+| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. |
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
@@ -476,8 +496,9 @@ requests and flushes every collection before exiting.
 | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.12}]}` |
 
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
-  `index` is `{"type": "flat"}` or `{"type": "hnsw"}`, optionally with `m`,
-  `ef_construction` and `ef_search`. Names are 1 to 64 ASCII letters,
+  `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
+  `ef_construction` and `ef_search`) or `{"type": "pq"}` (optionally with
+  `subspaces`, `training_points` and `rerank`). Names are 1 to 64 ASCII letters,
   digits, `-` or `_`.
 - **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
   for a missing collection or point, `409` for a name that's taken, `413`
@@ -557,8 +578,9 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] Storage: segments, write-ahead log and recovery
 - [x] Server network API
 
-Possible next steps: PQ as a collection index (with exact re-ranking from storage), metadata
-filters on search, and authentication for the API.
+Possible next steps: metadata filters on search, PQ snapshots (a PQ
+collection retrains on every start), and dropping the engine's full-precision
+copy of each vector for PQ collections.
 
 ## License
 

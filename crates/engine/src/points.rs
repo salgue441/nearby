@@ -82,7 +82,8 @@ impl PointTable {
         (*self.live.get(s)?).then(|| self.ids[s])
     }
 
-    fn vector(&self, slot: u32) -> &[f32] {
+    /// The vector in `slot`, live or dead.
+    pub(crate) fn vector(&self, slot: u32) -> &[f32] {
         let s = slot as usize;
         &self.vectors[s * self.dim..(s + 1) * self.dim]
     }

@@ -12,20 +12,24 @@
 //! - **Deletes.** Indexes only append, so a replaced or deleted point's old
 //!   vector stays in the index, where searches skip it; once dead vectors
 //!   outnumber live ones, the index is rebuilt without them.
-//! - **Recovery.** Indexes are not persisted: opening a collection replays
-//!   its storage and rebuilds the index, in parallel for HNSW.
+//! - **Recovery.** Opening a collection replays its storage and rebuilds the
+//!   index, in parallel where the index allows. An HNSW collection saves a
+//!   snapshot on checkpoint, so it only replays the log written since.
+//! - **Indexes.** Flat (exact), HNSW, or PQ: compressed codes whose
+//!   candidates are re-ranked by exact distance (see [`PqConfig`]).
 
 mod backend;
 mod collection;
 mod config;
 mod database;
 mod points;
+mod pq;
 mod snapshot;
 
 use std::num::NonZeroUsize;
 
 pub use collection::{Collection, CollectionInfo};
-pub use config::{CollectionConfig, HnswConfig, IndexConfig};
+pub use config::{CollectionConfig, HnswConfig, IndexConfig, PqConfig};
 pub use database::{CollectionHandle, Database};
 pub use nearby_storage::Durability;
 
