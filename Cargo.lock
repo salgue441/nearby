@@ -192,6 +192,11 @@ dependencies = [
 [[package]]
 name = "nearby-storage"
 version = "0.1.0"
+dependencies = [
+ "nearby-core",
+ "tempfile",
+ "tracing",
+]
 
 [[package]]
 name = "nu-ansi-term"
