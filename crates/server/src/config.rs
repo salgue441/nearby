@@ -89,6 +89,11 @@ pub struct ServerConfig {
     /// variable, when set, takes precedence, so the key can stay out of the
     /// file. Default: none (no authentication).
     pub api_key: Option<String>,
+    /// PEM certificate chain to serve HTTPS with, together with `tls_key`.
+    /// Default: none (plain HTTP).
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key for `tls_cert`. Default: none.
+    pub tls_key: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -97,6 +102,23 @@ impl Default for ServerConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 7700)),
             max_body_bytes: 64 << 20,
             api_key: None,
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+impl ServerConfig {
+    /// The certificate and key files to serve HTTPS with, if configured.
+    ///
+    /// # Errors
+    ///
+    /// If only one of `tls_cert` and `tls_key` is set.
+    pub fn tls(&self) -> anyhow::Result<Option<(&Path, &Path)>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("[server] needs both tls_cert and tls_key, or neither"),
         }
     }
 }
@@ -291,6 +313,32 @@ mod tests {
         assert_eq!(log.file_prefix, "nearby");
         assert_eq!(log.rotation, Rotation::Daily);
         assert_eq!(log.max_files, 14);
+    }
+
+    #[test]
+    fn tls_needs_both_files_or_neither() {
+        let tls = |text: &str| {
+            Config::from_toml(text)
+                .unwrap()
+                .server
+                .tls()
+                .map(|t| t.is_some())
+        };
+        assert!(!tls("").unwrap(), "plain HTTP by default");
+        assert!(tls("[server]\ntls_cert = \"c.pem\"\ntls_key = \"k.pem\"").unwrap());
+        let both =
+            Config::from_toml("[server]\ntls_cert = \"c.pem\"\ntls_key = \"k.pem\"").unwrap();
+        assert_eq!(
+            both.server.tls().unwrap(),
+            Some((Path::new("c.pem"), Path::new("k.pem")))
+        );
+        for half in [
+            "[server]\ntls_cert = \"c.pem\"",
+            "[server]\ntls_key = \"k.pem\"",
+        ] {
+            let err = tls(half).unwrap_err().to_string();
+            assert!(err.contains("both tls_cert and tls_key"), "{err}");
+        }
     }
 
     #[test]
