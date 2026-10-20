@@ -1,5 +1,6 @@
 //! The indexes a collection can search with, behind one interface.
 
+use std::io::Write;
 use std::num::NonZeroUsize;
 
 use nearby_core::{PointId, Result};
@@ -15,6 +16,20 @@ use crate::config::{CollectionConfig, IndexConfig};
 pub(crate) trait IndexBackend: VectorIndex + std::fmt::Debug {
     /// Appends `points`, using up to `threads` threads where the index can.
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()>;
+
+    /// Whether [`IndexBackend::save`] is supported.
+    fn can_save(&self) -> bool {
+        false
+    }
+
+    /// Writes the index for a snapshot (see `crate::snapshot`).
+    ///
+    /// # Panics
+    ///
+    /// If [`IndexBackend::can_save`] is false.
+    fn save(&self, _w: &mut dyn Write) -> Result<()> {
+        unreachable!("this index cannot be saved")
+    }
 }
 
 impl IndexBackend for FlatIndex {
@@ -28,6 +43,14 @@ impl IndexBackend for FlatIndex {
 impl IndexBackend for Hnsw {
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()> {
         Hnsw::insert_batch(self, points, threads)
+    }
+
+    fn can_save(&self) -> bool {
+        true
+    }
+
+    fn save(&self, w: &mut dyn Write) -> Result<()> {
+        self.write_to(w)
     }
 }
 

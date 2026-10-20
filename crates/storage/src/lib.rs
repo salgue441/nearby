@@ -18,13 +18,12 @@
 //! rebuilt from the replayed ops by whoever opens it.
 
 mod codec;
-mod crc;
 mod fsio;
 mod manifest;
 mod segment;
 mod store;
 mod wal;
 
-pub use fsio::atomic_write;
+pub use fsio::{atomic_write, atomic_write_with};
 pub use store::{CollectionStore, StoreOptions};
 pub use wal::{Durability, Op};

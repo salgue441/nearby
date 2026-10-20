@@ -17,6 +17,11 @@ impl SplitMix64 {
         Self { state: seed }
     }
 
+    /// The current state, from which [`SplitMix64::new`] resumes the sequence.
+    pub(crate) fn state(&self) -> u64 {
+        self.state
+    }
+
     /// The next 64 uniformly distributed random bits.
     pub(crate) fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);

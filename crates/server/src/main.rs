@@ -80,10 +80,10 @@ async fn serve(
         .await
         .context("serving the HTTP API")?;
 
-    tracing::info!("shutting down: flushing collections");
-    tokio::task::spawn_blocking(move || db.flush_all())
+    tracing::info!("shutting down: checkpointing collections");
+    tokio::task::spawn_blocking(move || db.checkpoint_all())
         .await?
-        .context("flushing collections")
+        .context("checkpointing collections")
 }
 
 /// Resolves on Ctrl-C, or on SIGTERM on Unix (what service managers send).

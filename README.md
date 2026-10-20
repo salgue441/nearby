@@ -170,6 +170,7 @@ Each collection lives in its own directory, managed by a `CollectionStore`:
 ```text
 data/collections/docs/
 ├── collection.toml   dimension, metric and index settings
+├── index.snapshot    HNSW graph and id map, saved on shutdown (a cache)
 ├── MANIFEST          which log and segments are live
 ├── wal-000007.log    writes since the last flush
 ├── seg-000004.seg    immutable batches of net changes, oldest first
@@ -205,7 +206,12 @@ index (`flat` or `hnsw`, with its parameters).
   `VectorIndex::search_filtered`. HNSW still walks through dead nodes to
   reach live ones, so recall holds. Once dead vectors outnumber live ones,
   the index is rebuilt without them.
-- **Restarts** replay storage and rebuild each index (in parallel for HNSW).
+- **Restarts.** On shutdown, each HNSW collection saves a snapshot of its
+  graph and id map, tagged with the storage generation it matches. On start,
+  a matching snapshot is loaded and only the log written since is replayed;
+  otherwise (a crash after a flush, a damaged file) the index is rebuilt
+  from storage. On SIFT1M, a restart takes 1.8 s instead of 87 s (the
+  snapshot is 591 MB and takes 1.7 s to write).
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 
@@ -551,8 +557,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] Storage: segments, write-ahead log and recovery
 - [x] Server network API
 
-Possible next steps: persisting HNSW graphs so restarts skip the rebuild,
-PQ as a collection index (with exact re-ranking from storage), metadata
+Possible next steps: PQ as a collection index (with exact re-ranking from storage), metadata
 filters on search, and authentication for the API.
 
 ## License

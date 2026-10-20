@@ -110,10 +110,50 @@ impl CollectionStore {
     ///
     /// An I/O error (`NotFound` if `dir` holds no store), or
     /// [`Error::Corruption`] if the manifest or a segment is damaged.
-    pub fn open(dir: &Path, options: StoreOptions, mut apply: impl FnMut(Op<'_>)) -> Result<Self> {
+    pub fn open(dir: &Path, options: StoreOptions, apply: impl FnMut(Op<'_>)) -> Result<Self> {
+        Self::open_replaying(dir, options, true, apply)
+    }
+
+    /// Like [`CollectionStore::open`], but replays only the log, skipping the
+    /// segments.
+    ///
+    /// For callers that kept their own snapshot of the state the segments
+    /// hold, taken when [`CollectionStore::generation`] was what
+    /// [`CollectionStore::read_generation`] still reports.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`CollectionStore::open`].
+    pub fn open_log_only(
+        dir: &Path,
+        options: StoreOptions,
+        apply: impl FnMut(Op<'_>),
+    ) -> Result<Self> {
+        Self::open_replaying(dir, options, false, apply)
+    }
+
+    /// The [`CollectionStore::generation`] of the store in `dir`, without
+    /// opening it.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error (`NotFound` if `dir` holds no store), or
+    /// [`Error::Corruption`] if the manifest is damaged.
+    pub fn read_generation(dir: &Path) -> Result<u64> {
+        Ok(Manifest::read(dir)?.next_file)
+    }
+
+    fn open_replaying(
+        dir: &Path,
+        options: StoreOptions,
+        replay_segments: bool,
+        mut apply: impl FnMut(Op<'_>),
+    ) -> Result<Self> {
         let manifest = Manifest::read(dir)?;
-        for name in &manifest.segments {
-            segment::read(&dir.join(name), manifest.dim, &mut apply)?;
+        if replay_segments {
+            for name in &manifest.segments {
+                segment::read(&dir.join(name), manifest.dim, &mut apply)?;
+            }
         }
         let wal = Wal::open(
             &dir.join(&manifest.wal),
@@ -129,6 +169,13 @@ impl CollectionStore {
         };
         store.remove_unreferenced_files()?;
         Ok(store)
+    }
+
+    /// Identifies what the segments hold: it changes whenever a flush or
+    /// compaction rewrites them, and never otherwise. Writes to the log
+    /// leave it alone.
+    pub fn generation(&self) -> u64 {
+        self.manifest.next_file
     }
 
     /// The dimension every vector must have.
@@ -430,6 +477,46 @@ mod tests {
 
         let err = CollectionStore::open(dir.path(), StoreOptions::default(), |_| {}).unwrap_err();
         assert!(matches!(err, Error::Corruption { .. }), "{err}");
+    }
+
+    #[test]
+    fn generation_changes_only_when_segments_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CollectionStore::create(dir.path(), 2, StoreOptions::default()).unwrap();
+        let g0 = store.generation();
+        upsert(&mut store, 1, 1.0);
+        assert_eq!(store.generation(), g0, "log writes keep it");
+        store.flush().unwrap();
+        let g1 = store.generation();
+        assert_ne!(g1, g0);
+        store.flush().unwrap();
+        assert_eq!(store.generation(), g1, "an empty flush keeps it");
+        upsert(&mut store, 2, 2.0);
+        store.compact().unwrap();
+        assert_ne!(store.generation(), g1);
+        assert_eq!(
+            CollectionStore::read_generation(dir.path()).unwrap(),
+            store.generation()
+        );
+    }
+
+    #[test]
+    fn log_only_opening_skips_the_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CollectionStore::create(dir.path(), 2, StoreOptions::default()).unwrap();
+        upsert(&mut store, 1, 1.0);
+        store.flush().unwrap();
+        upsert(&mut store, 2, 2.0);
+        delete(&mut store, 1);
+        drop(store);
+
+        let mut seen = Vec::new();
+        let store = CollectionStore::open_log_only(dir.path(), StoreOptions::default(), |op| {
+            seen.push(format!("{op:?}"));
+        })
+        .unwrap();
+        assert_eq!(seen.len(), 2, "only the two logged ops: {seen:?}");
+        assert_eq!(store.segment_count(), 1);
     }
 
     #[test]
