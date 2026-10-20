@@ -103,7 +103,14 @@ impl ProductQuantizer {
                 .copied()
                 .collect();
             let seed = params.seed.wrapping_add(s as u64);
-            kmeans(&slices, sub_dim, CENTROIDS, params.iterations, seed)
+            kmeans(
+                &slices,
+                sub_dim,
+                CENTROIDS,
+                params.iterations,
+                seed,
+                NonZeroUsize::MIN,
+            )
         });
         Ok(Self {
             dim,

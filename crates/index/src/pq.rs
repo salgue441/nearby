@@ -15,11 +15,13 @@
 //! vectors are approximated).
 
 mod index;
+mod ivf;
 mod kmeans;
 mod params;
 mod quantizer;
 
 pub use self::index::PqIndex;
+pub use self::ivf::{IvfPqIndex, IvfPqParams};
 pub use self::params::PqParams;
 pub use self::quantizer::ProductQuantizer;
 
