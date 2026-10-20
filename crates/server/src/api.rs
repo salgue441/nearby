@@ -7,10 +7,13 @@
 //! | `PUT` | `/collections/{name}` | collection config | `201`, collection info |
 //! | `GET` | `/collections/{name}` | | collection info |
 //! | `DELETE` | `/collections/{name}` | | `204` |
-//! | `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...]}]}` | `{"upserted": n}` |
+//! | `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...], "payload": {...}}]}` | `{"upserted": n}` |
 //! | `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": n}` |
-//! | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
-//! | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.5}]}` |
+//! | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
+//! | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.5, "payload": {...}}]}` |
+//!
+//! Payloads are optional objects of booleans, numbers and strings; filters
+//! are described on `nearby_engine::Filter`.
 //!
 //! Errors come back as `{"error": "..."}` with a 4xx or 5xx status. With an
 //! API key configured, every endpoint but `/health` requires
@@ -26,7 +29,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use nearby_core::{Error, PointId};
-use nearby_engine::{CollectionConfig, CollectionInfo, Database};
+use nearby_engine::{CollectionConfig, CollectionInfo, Database, Filter, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -127,6 +130,8 @@ struct UpsertRequest {
 struct PointBody {
     id: PointId,
     vector: Vec<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<Payload>,
 }
 
 async fn upsert_points(
@@ -137,13 +142,13 @@ async fn upsert_points(
     let upserted = request.points.len();
     blocking(move || {
         let handle = db.collection(&name)?;
-        let points: Vec<(PointId, &[f32])> = request
+        let points: Vec<(PointId, &[f32], Option<&Payload>)> = request
             .points
             .iter()
-            .map(|p| (p.id, p.vector.as_slice()))
+            .map(|p| (p.id, p.vector.as_slice(), p.payload.as_ref()))
             .collect();
         let mut collection = handle.write().unwrap_or_else(PoisonError::into_inner);
-        collection.upsert(&points)
+        collection.upsert_with_payloads(&points)
     })
     .await?;
     Ok(Json(json!({ "upserted": upserted })))
@@ -179,6 +184,7 @@ async fn get_point(
     Ok(Json(PointBody {
         id,
         vector: vector.to_vec(),
+        payload: collection.payload(id).cloned(),
     }))
 }
 
@@ -188,6 +194,12 @@ struct SearchRequest {
     vector: Vec<f32>,
     #[serde(default = "default_k")]
     k: usize,
+    /// Only points whose payload matches are returned.
+    #[serde(default)]
+    filter: Option<Filter>,
+    /// Whether each result carries its point's payload.
+    #[serde(default)]
+    with_payload: bool,
 }
 
 fn default_k() -> usize {
@@ -203,6 +215,8 @@ struct SearchResponse {
 struct Hit {
     id: PointId,
     distance: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload: Option<Payload>,
 }
 
 async fn search(
@@ -213,21 +227,24 @@ async fn search(
     if request.k > MAX_K {
         return Err(ApiError::bad_request(format!("k must be at most {MAX_K}")));
     }
-    let hits = blocking(move || {
+    let results = blocking(move || {
         let handle = db.collection(&name)?;
         let collection = handle.read().unwrap_or_else(PoisonError::into_inner);
-        collection.search(&request.vector, request.k)
-    })
-    .await?;
-    Ok(Json(SearchResponse {
-        results: hits
+        let hits = collection.search_where(&request.vector, request.k, request.filter.as_ref())?;
+        Ok(hits
             .into_iter()
             .map(|p| Hit {
                 id: p.id,
                 distance: p.distance,
+                payload: request
+                    .with_payload
+                    .then(|| collection.payload(p.id).cloned())
+                    .flatten(),
             })
-            .collect(),
-    }))
+            .collect())
+    })
+    .await?;
+    Ok(Json(SearchResponse { results }))
 }
 
 /// Runs engine work, which can take a while (an fsync, an index build), on
@@ -504,6 +521,67 @@ mod tests {
         assert_eq!(body["error"], "point `2` not found");
         let (_, info) = server.send(Method::GET, "/collections/docs", None).await;
         assert_eq!(info["points"], 2);
+    }
+
+    #[tokio::test]
+    async fn payloads_are_returned_and_filtered_on() {
+        let server = TestServer::new();
+        server.create_docs().await;
+        let points = json!({ "points": [
+            { "id": 1, "vector": [0.0, 0.0], "payload": { "lang": "en", "year": 2020 } },
+            { "id": 2, "vector": [1.0, 0.0], "payload": { "lang": "es", "year": 2023 } },
+            { "id": 3, "vector": [2.0, 0.0] },
+        ]});
+        server
+            .send(Method::PUT, "/collections/docs/points", Some(points))
+            .await;
+
+        let (_, body) = server
+            .send(Method::GET, "/collections/docs/points/2", None)
+            .await;
+        assert_eq!(
+            body,
+            json!({ "id": 2, "vector": [1.0, 0.0], "payload": { "lang": "es", "year": 2023 } })
+        );
+        let (_, body) = server
+            .send(Method::GET, "/collections/docs/points/3", None)
+            .await;
+        assert_eq!(
+            body,
+            json!({ "id": 3, "vector": [2.0, 0.0] }),
+            "no payload key"
+        );
+
+        let query = json!({
+            "vector": [0.0, 0.0],
+            "k": 3,
+            "filter": { "or": [
+                { "field": "lang", "eq": "es" },
+                { "field": "year", "lt": 2021 },
+            ]},
+            "with_payload": true,
+        });
+        let (status, body) = server
+            .send(Method::POST, "/collections/docs/search", Some(query))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({ "results": [
+                { "id": 1, "distance": 0.0, "payload": { "lang": "en", "year": 2020 } },
+                { "id": 2, "distance": 1.0, "payload": { "lang": "es", "year": 2023 } },
+            ]})
+        );
+
+        let bad = json!({ "vector": [0.0, 0.0], "filter": { "field": "lang" } });
+        let (status, body) = server
+            .send(Method::POST, "/collections/docs/search", Some(bad))
+            .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body["error"].as_str().unwrap().contains("exactly one"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
