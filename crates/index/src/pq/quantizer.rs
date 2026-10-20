@@ -1,5 +1,6 @@
 //! Learning codebooks, encoding vectors, and building distance tables.
 
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 
 use nearby_core::distance::normalize;
@@ -7,6 +8,7 @@ use nearby_core::{Error, Metric, Result, validate_vector};
 
 use super::kmeans::{kmeans, nearest};
 use super::{CENTROIDS, PqParams, slice_dot, slice_l2};
+use crate::codec::{Decoder, Encoder};
 use crate::parallel::parallel_map;
 
 /// Compresses vectors into `subspaces`-byte codes, one byte per slice.
@@ -137,6 +139,32 @@ impl ProductQuantizer {
 
     fn sub_dim(&self) -> usize {
         self.dim / self.subspaces
+    }
+
+    /// Writes the quantizer as part of an index file:
+    /// dim u32, metric u8, subspaces u32, codebooks f32 × subspaces × 256 × dim / subspaces.
+    pub(super) fn write_section(&self, e: &mut Encoder<impl Write>) -> Result<()> {
+        e.u32(self.dim)?;
+        e.metric(self.metric)?;
+        e.u32(self.subspaces)?;
+        e.f32s(&self.codebooks)
+    }
+
+    /// Reads a quantizer written by [`ProductQuantizer::write_section`].
+    pub(super) fn read_section(d: &mut Decoder<impl Read>) -> Result<Self> {
+        let dim = d.u32()?;
+        let metric = d.metric()?;
+        let subspaces = d.u32()?;
+        if dim == 0 || subspaces == 0 || !dim.is_multiple_of(subspaces) {
+            return Err(d.corrupt("subspaces must divide a nonzero dimension"));
+        }
+        let codebooks = d.f32s(CENTROIDS * dim)?;
+        Ok(Self {
+            dim,
+            metric,
+            subspaces,
+            codebooks,
+        })
     }
 
     /// Subspace `s`'s 256 centroids, back to back.

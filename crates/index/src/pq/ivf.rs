@@ -1,5 +1,6 @@
 //! IVF-PQ: product-quantized codes grouped into an inverted file.
 
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 
 use nearby_core::distance::normalize;
@@ -8,6 +9,7 @@ use nearby_core::{Error, Metric, PointId, Result, ScoredPoint, TopK, validate_ve
 use super::kmeans::{kmeans, nearest};
 use super::{PqParams, ProductQuantizer};
 use crate::VectorIndex;
+use crate::codec::{Decoder, Encoder};
 use crate::parallel::parallel_map;
 
 /// Vectors assigned and encoded per parallel task in [`IvfPqIndex::add_batch`].
@@ -260,7 +262,83 @@ impl IvfPqIndex {
         ranked.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         ranked.into_iter().map(|(_, list)| list).collect()
     }
+
+    /// Writes the index to `w`, so [`IvfPqIndex::read_from`] can restore it
+    /// without retraining:
+    ///
+    /// ```text
+    /// magic "NBIVFPQ1", quantizer (see ProductQuantizer), lists u32, probe u32,
+    /// centroids f32 × lists × dim,
+    /// for each list: count u64, ids u64 × count, codes u8 × count × code_len,
+    /// crc32 u32
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// If writing fails.
+    pub fn write_to(&self, w: impl Write) -> Result<()> {
+        let mut e = Encoder::new(w);
+        e.bytes(&MAGIC)?;
+        self.quantizer.write_section(&mut e)?;
+        e.u32(self.lists.len())?;
+        e.u32(self.probe)?;
+        e.f32s(&self.centroids)?;
+        for list in &self.lists {
+            e.u64(list.ids.len() as u64)?;
+            e.u64s(&list.ids)?;
+            e.bytes(&list.codes)?;
+        }
+        e.finish()
+    }
+
+    /// Restores an index written by [`IvfPqIndex::write_to`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] if the data is truncated, fails its checksum or
+    /// is inconsistent; an I/O error if reading fails.
+    pub fn read_from(r: impl Read) -> Result<Self> {
+        let mut d = Decoder::new(r, "IVF-PQ index");
+        d.magic(MAGIC)?;
+        let quantizer = ProductQuantizer::read_section(&mut d)?;
+        let list_count = d.u32()?;
+        let probe = d.u32()?;
+        if list_count == 0 || !(1..=list_count).contains(&probe) {
+            return Err(d.corrupt("probe must be between 1 and the list count"));
+        }
+        let size = list_count
+            .checked_mul(quantizer.dim())
+            .ok_or_else(|| d.corrupt("size overflow"))?;
+        let centroids = d.f32s(size)?;
+        let mut lists = d.vec(list_count)?;
+        let mut len = 0usize;
+        for _ in 0..list_count {
+            let count = usize::try_from(d.u64()?).map_err(|_| d.corrupt("count too large"))?;
+            let ids = d.u64s(count)?;
+            let size = count
+                .checked_mul(quantizer.code_len())
+                .ok_or_else(|| d.corrupt("size overflow"))?;
+            let codes = d.bytes(size)?;
+            len += count;
+            lists.push(InvertedList { ids, codes });
+        }
+        d.finish()?;
+        Ok(Self {
+            quantizer,
+            centroids,
+            lists,
+            probe,
+            len,
+        })
+    }
+
+    /// Every id, list by list.
+    pub fn ids(&self) -> impl Iterator<Item = PointId> + '_ {
+        self.lists.iter().flat_map(|list| list.ids.iter().copied())
+    }
 }
+
+const MAGIC: [u8; 8] = *b"NBIVFPQ1";
 
 impl VectorIndex for IvfPqIndex {
     fn dim(&self) -> usize {
@@ -418,5 +496,47 @@ mod tests {
         let err = IvfPqIndex::train(DIM, Metric::L2, &params(400, 1), &data, NonZeroUsize::MIN)
             .unwrap_err();
         assert!(err.to_string().contains("400 lists"), "{err}");
+    }
+
+    fn bytes(index: &IvfPqIndex) -> Vec<u8> {
+        let mut out = Vec::new();
+        index.write_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn round_trips_exactly() {
+        let data = random(800, 8);
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let original = index(metric, &data, 16, 3);
+            let restored = IvfPqIndex::read_from(bytes(&original).as_slice()).unwrap();
+            assert_eq!(bytes(&restored), bytes(&original), "{metric:?}");
+            assert_eq!((restored.len(), restored.probe()), (800, 3));
+            assert_eq!(
+                restored.ids().collect::<Vec<_>>(),
+                original.ids().collect::<Vec<_>>()
+            );
+            let query = &data[..DIM];
+            assert_eq!(
+                restored.search(query, 10).unwrap(),
+                original.search(query, 10).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn damage_is_detected() {
+        let good = bytes(&index(Metric::L2, &random(400, 9), 8, 2));
+        let mut flipped = good.clone();
+        flipped[good.len() / 2] ^= 0x10;
+        let mut bad_probe = good.clone();
+        // probe sits after magic (8), dim (4), metric (1), subspaces (4),
+        // codebooks (256 x 8 values x 4 bytes) and the list count (4).
+        let at = 8 + 4 + 1 + 4 + 256 * DIM * 4 + 4;
+        bad_probe[at..at + 4].copy_from_slice(&9u32.to_le_bytes());
+        for data in [&good[..good.len() - 1], &good[..30], &flipped, &bad_probe] {
+            let err = IvfPqIndex::read_from(data).unwrap_err();
+            assert!(matches!(err, Error::Corruption { .. }), "{err}");
+        }
     }
 }
