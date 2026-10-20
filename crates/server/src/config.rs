@@ -84,6 +84,11 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// Largest request body accepted, in bytes. Default: 64 MiB.
     pub max_body_bytes: usize,
+    /// When set, every endpoint but `/health` requires
+    /// `Authorization: Bearer <api_key>`. The `NEARBY_API_KEY` environment
+    /// variable, when set, takes precedence, so the key can stay out of the
+    /// file. Default: none (no authentication).
+    pub api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -91,6 +96,7 @@ impl Default for ServerConfig {
         Self {
             listen: SocketAddr::from(([127, 0, 0, 1], 7700)),
             max_body_bytes: 64 << 20,
+            api_key: None,
         }
     }
 }
@@ -270,6 +276,7 @@ mod tests {
         let cfg = Config::default();
         assert_eq!(cfg.server.listen.to_string(), "127.0.0.1:7700");
         assert_eq!(cfg.server.max_body_bytes, 64 << 20);
+        assert_eq!(cfg.server.api_key, None);
         assert_eq!(cfg.engine.durability, DurabilityConfig::Sync);
         assert_eq!(cfg.engine.threads, 0);
         assert_eq!(cfg.engine.flush_after_ops, 50_000);
@@ -292,6 +299,7 @@ mod tests {
             r#"
             [server]
             listen = "0.0.0.0:9000"
+            api_key = "k3y"
             [engine]
             durability = "nosync"
             threads = 3
@@ -299,6 +307,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.server.listen.port(), 9000);
+        assert_eq!(cfg.server.api_key.as_deref(), Some("k3y"));
         let options = cfg.engine.options();
         assert_eq!(options.durability, Durability::NoSync);
         assert_eq!(options.threads.get(), 3);
