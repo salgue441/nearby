@@ -7,6 +7,7 @@ use nearby_core::{PointId, Result};
 use nearby_index::{FlatIndex, Hnsw, VectorIndex};
 
 use crate::config::{CollectionConfig, IndexConfig};
+use crate::pq::PqBackend;
 
 /// An index the engine can both search and append to.
 ///
@@ -16,6 +17,13 @@ use crate::config::{CollectionConfig, IndexConfig};
 pub(crate) trait IndexBackend: VectorIndex + std::fmt::Debug {
     /// Appends `points`, using up to `threads` threads where the index can.
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()>;
+
+    /// If the index's distances are approximate: how many candidates to
+    /// fetch per requested result, to be re-ranked by exact distance.
+    /// `None` means search results are final.
+    fn rerank(&self) -> Option<NonZeroUsize> {
+        None
+    }
 
     /// Whether [`IndexBackend::save`] is supported.
     fn can_save(&self) -> bool {
@@ -71,6 +79,7 @@ pub(crate) fn new_index(
             hnsw.params(),
             capacity,
         )?),
+        IndexConfig::Pq(pq) => Box::new(PqBackend::new(config.dim, config.metric, pq)?),
     })
 }
 

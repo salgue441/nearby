@@ -114,6 +114,14 @@ impl FlatIndex {
         let start = pos * self.dim;
         Some(&self.data[start..start + self.dim])
     }
+
+    /// Every vector as `(id, vector)`, in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
+        self.ids
+            .iter()
+            .copied()
+            .zip(self.data.chunks_exact(self.dim))
+    }
 }
 
 impl VectorIndex for FlatIndex {
@@ -232,6 +240,14 @@ mod tests {
         let index = line_index(Metric::L2);
         assert_eq!(index.get(3), Some(&[3.0, 0.0][..]));
         assert_eq!(index.get(5), None);
+    }
+
+    #[test]
+    fn iter_yields_vectors_in_insertion_order() {
+        let index = line_index(Metric::L2);
+        let points: Vec<(PointId, &[f32])> = index.iter().collect();
+        assert_eq!(points.len(), 5);
+        assert_eq!(points[3], (3, &[3.0, 0.0][..]));
     }
 
     #[test]

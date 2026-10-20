@@ -48,6 +48,10 @@ pub struct ProductQuantizer {
 }
 
 impl ProductQuantizer {
+    /// The fewest training vectors [`ProductQuantizer::train`] accepts: one
+    /// per centroid.
+    pub const MIN_TRAINING: usize = CENTROIDS;
+
     /// Learns one codebook per subspace from `training`, which holds
     /// training vectors of `dim` values each, back to back.
     ///
@@ -77,9 +81,10 @@ impl ProductQuantizer {
             )));
         }
         let n = training.len() / dim;
-        if n < CENTROIDS {
+        if n < Self::MIN_TRAINING {
             return Err(Error::InvalidParameter(format!(
-                "training needs at least {CENTROIDS} vectors, got {n}"
+                "training needs at least {} vectors, got {n}",
+                Self::MIN_TRAINING
             )));
         }
         for vector in training.chunks_exact(dim) {
