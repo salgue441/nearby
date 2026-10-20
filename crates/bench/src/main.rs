@@ -10,7 +10,9 @@
 mod dataset;
 mod metrics;
 
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
@@ -28,6 +30,7 @@ usage: nearby-bench [DATASET_DIR] [OPTIONS]
   --k N                    neighbors per query (default: 10)
   --m N                    HNSW links per node (default: 16)
   --ef-construction N      HNSW build quality (default: 200)
+  --threads N              threads that build HNSW (default: all available)
   --ef N,N,...             HNSW ef_search values to sweep (default: 10,20,40,80,160,320)
                            (a search uses at least k, so smaller values run as k)";
 
@@ -51,6 +54,8 @@ struct Args {
     k: usize,
     m: usize,
     ef_construction: usize,
+    /// Threads that build the HNSW index.
+    threads: NonZeroUsize,
     /// One result row is reported per value.
     ef_search: Vec<usize>,
 }
@@ -75,7 +80,11 @@ fn main() -> anyhow::Result<()> {
 
     if args.index != IndexChoice::Hnsw {
         let mut flat = FlatIndex::with_capacity(dim, Metric::L2, len);
-        let build_time = build(&data, |id, vector| flat.add(id, vector))?;
+        let build_time = build(&data, |batch| {
+            batch
+                .iter()
+                .try_for_each(|&(id, vector)| flat.add(id, vector))
+        })?;
         println!("build    flat: {build_time:.2?}");
         rows.push((
             "flat".to_owned(),
@@ -91,11 +100,12 @@ fn main() -> anyhow::Result<()> {
             ..HnswParams::default()
         };
         let mut hnsw = Hnsw::with_capacity(dim, Metric::L2, params, len)?;
-        let build_time = build(&data, |id, vector| hnsw.insert(id, vector))?;
+        let build_time = build(&data, |batch| hnsw.insert_batch(batch, args.threads))?;
         println!(
-            "build    hnsw (m={}, ef_construction={}): {build_time:.2?}, {} layers",
+            "build    hnsw (m={}, ef_construction={}, threads={}): {build_time:.2?}, {} layers",
             args.m,
             args.ef_construction,
+            args.threads,
             hnsw.max_level() + 1
         );
         let sweep = effective_ef(&args.ef_search, args.k);
@@ -139,27 +149,31 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Streams the base vectors into an index through `insert`, which receives
-/// each vector's position in the file as its id. Returns the time spent in
-/// `insert` alone, excluding file reads.
+/// Streams the base vectors into an index through `insert`, one chunk of
+/// `(id, vector)` pairs at a time, where each id is the vector's position in
+/// the file. Returns the time spent in `insert` alone, excluding file reads.
 ///
 /// Inserts are timed per chunk, not per vector: a flat insert is a short
-/// copy, and timing each one would mostly measure the timer.
+/// copy, and timing each one would mostly measure the timer. Chunks also let
+/// an index insert many vectors in parallel.
 ///
 /// # Errors
 ///
 /// If reading the base file or an insert fails.
 fn build(
     data: &Dataset,
-    mut insert: impl FnMut(PointId, &[f32]) -> nearby_core::Result<()>,
+    mut insert: impl FnMut(&[(PointId, &[f32])]) -> nearby_core::Result<()>,
 ) -> anyhow::Result<Duration> {
     let dim = data.dim();
     let mut elapsed = Duration::ZERO;
     data.for_each_base_chunk(BUILD_CHUNK, |first, chunk| {
+        let batch: Vec<(PointId, &[f32])> = chunk
+            .chunks_exact(dim)
+            .enumerate()
+            .map(|(offset, vector)| ((first + offset) as PointId, vector))
+            .collect();
         let start = Instant::now();
-        for (offset, vector) in chunk.chunks_exact(dim).enumerate() {
-            insert((first + offset) as PointId, vector)?;
-        }
+        insert(&batch)?;
         elapsed += start.elapsed();
         Ok(())
     })?;
@@ -220,7 +234,7 @@ fn run_queries(
 /// # Errors
 ///
 /// On an unknown option or index, a missing or non-numeric value, `--k 0`,
-/// or an `--ef` list that is empty or contains 0. Errors about unknown or
+/// `--threads 0`, or an `--ef` list that is empty or contains 0. Errors about unknown or
 /// incomplete options include [`USAGE`].
 fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Args>> {
     let mut args = Args {
@@ -229,6 +243,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
         k: 10,
         m: 16,
         ef_construction: 200,
+        threads: default_threads(),
         ef_search: vec![10, 20, 40, 80, 160, 320],
     };
     let mut it = raw.into_iter();
@@ -251,6 +266,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
             "--ef-construction" => {
                 args.ef_construction = parse_number(&value("--ef-construction")?)?;
             }
+            "--threads" => {
+                args.threads = NonZeroUsize::new(parse_number(&value("--threads")?)?)
+                    .context("--threads must be at least 1")?;
+            }
             "--ef" => {
                 args.ef_search = value("--ef")?
                     .split(',')
@@ -269,6 +288,11 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
         "--ef values must be at least 1"
     );
     Ok(Some(args))
+}
+
+/// Every thread the machine offers, or 1 if that can't be determined.
+fn default_threads() -> NonZeroUsize {
+    thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Parses one numeric option value, ignoring surrounding whitespace.
@@ -301,6 +325,7 @@ mod tests {
                 k: 10,
                 m: 16,
                 ef_construction: 200,
+                threads: default_threads(),
                 ef_search: vec![10, 20, 40, 80, 160, 320],
             }
         );
@@ -318,6 +343,8 @@ mod tests {
             "32",
             "--ef-construction",
             "400",
+            "--threads",
+            "3",
             "--ef",
             "50, 100,200",
         ])
@@ -327,6 +354,7 @@ mod tests {
         assert_eq!(args.index, IndexChoice::Hnsw);
         assert_eq!((args.k, args.m, args.ef_construction), (100, 32, 400));
         assert_eq!(args.ef_search, vec![50, 100, 200]);
+        assert_eq!(args.threads.get(), 3);
     }
 
     #[test]
@@ -344,7 +372,7 @@ mod tests {
 
     #[test]
     fn errors_explain_the_problem() {
-        let cases: [(&[&str], &str); 8] = [
+        let cases: [(&[&str], &str); 9] = [
             (&["--index", "ivf"], "unknown index `ivf`"),
             (&["--frobnicate"], "unknown option `--frobnicate`"),
             (&["--k"], "--k needs a value"),
@@ -353,6 +381,7 @@ mod tests {
             (&["--k", "0"], "--k must be at least 1"),
             (&["--ef", "10,,20"], "`` is not"),
             (&["--ef", "10,0"], "--ef values must be at least 1"),
+            (&["--threads", "0"], "--threads must be at least 1"),
         ];
         for (args, expected) in cases {
             let err = format!("{:#}", parse(args).unwrap_err());
@@ -416,7 +445,10 @@ mod tests {
         let data = Dataset::load(&dir, 1).unwrap();
 
         let mut flat = FlatIndex::new(1, Metric::L2);
-        build(&data, |id, v| flat.add(id, v)).unwrap();
+        build(&data, |batch| {
+            batch.iter().try_for_each(|&(id, v)| flat.add(id, v))
+        })
+        .unwrap();
         assert_eq!(flat.len(), n as usize);
         assert_eq!(flat.get(4_321), Some(&[4_321.0][..]));
     }
