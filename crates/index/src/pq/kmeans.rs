@@ -1,8 +1,19 @@
 //! k-means clustering (Lloyd's algorithm), deterministic for a given seed.
 
-use super::slice_l2;
+use std::num::NonZeroUsize;
 
+use nearby_core::distance::l2_squared;
+
+use super::slice_l2;
+use crate::parallel::parallel_map;
 use crate::rng::SplitMix64;
+
+/// Points assigned per parallel task.
+const ASSIGN_CHUNK: usize = 1024;
+
+/// Vectors at most this long are compared with an inlined loop; longer ones
+/// with the SIMD kernels, which only pay off once a call does real work.
+const SHORT: usize = 16;
 
 /// Clusters `n` points of `dim` values each, stored back to back in
 /// `points`, into `k` centroids, returned back to back in the same layout.
@@ -13,13 +24,15 @@ use crate::rng::SplitMix64;
 /// `iterations` rounds or until no point changes cluster. A cluster that
 /// ends up empty restarts at the point farthest from its own centroid.
 ///
-/// The same inputs always give the same centroids.
+/// Points are assigned on up to `threads` threads. The same inputs always
+/// give the same centroids, whatever `threads` is.
 pub(super) fn kmeans(
     points: &[f32],
     dim: usize,
     k: usize,
     iterations: usize,
     seed: u64,
+    threads: NonZeroUsize,
 ) -> Vec<f32> {
     let n = points.len() / dim;
     debug_assert!(k >= 1 && n >= k, "need at least k = {k} points, got {n}");
@@ -27,7 +40,14 @@ pub(super) fn kmeans(
     let mut assignments = vec![u32::MAX; n];
     let mut distances = vec![0.0; n];
     for _ in 0..iterations {
-        if !assign(points, &centroids, dim, &mut assignments, &mut distances) {
+        if !assign(
+            points,
+            &centroids,
+            dim,
+            &mut assignments,
+            &mut distances,
+            threads,
+        ) {
             break;
         }
         update(points, dim, &assignments, &mut distances, &mut centroids);
@@ -52,14 +72,14 @@ fn initial_centroids(points: &[f32], dim: usize, k: usize, seed: u64) -> Vec<f32
     centroids.extend_from_slice(first);
     let mut distances: Vec<f32> = points
         .chunks_exact(dim)
-        .map(|p| slice_l2(p, first))
+        .map(|p| distance(p, first))
         .collect();
 
     while centroids.len() < k * dim {
         let picked = point(points, dim, weighted_pick(&distances, &mut rng));
         centroids.extend_from_slice(picked);
         for (d, p) in distances.iter_mut().zip(points.chunks_exact(dim)) {
-            *d = d.min(slice_l2(p, picked));
+            *d = d.min(distance(p, picked));
         }
     }
     centroids
@@ -93,10 +113,17 @@ fn assign(
     dim: usize,
     assignments: &mut [u32],
     distances: &mut [f32],
+    threads: NonZeroUsize,
 ) -> bool {
+    let chunks: Vec<&[f32]> = points.chunks(ASSIGN_CHUNK * dim).collect();
+    let nearest_per_chunk = parallel_map(chunks.len(), threads, |i| {
+        chunks[i]
+            .chunks_exact(dim)
+            .map(|p| nearest(centroids, dim, p))
+            .collect::<Vec<_>>()
+    });
     let mut changed = false;
-    for (i, p) in points.chunks_exact(dim).enumerate() {
-        let (best, distance) = nearest(centroids, dim, p);
+    for (i, (best, distance)) in nearest_per_chunk.into_iter().flatten().enumerate() {
         changed |= assignments[i] != best;
         assignments[i] = best;
         distances[i] = distance;
@@ -109,7 +136,7 @@ fn assign(
 pub(super) fn nearest(centroids: &[f32], dim: usize, p: &[f32]) -> (u32, f32) {
     let mut best = (0, f32::INFINITY);
     for (c, centroid) in centroids.chunks_exact(dim).enumerate() {
-        let d = slice_l2(p, centroid);
+        let d = distance(p, centroid);
         if d < best.1 {
             best = (c as u32, d);
         }
@@ -165,6 +192,16 @@ fn farthest_point(distances: &[f32]) -> usize {
     best
 }
 
+/// Squared Euclidean distance, by whichever kernel suits the length.
+#[inline]
+fn distance(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() <= SHORT {
+        slice_l2(a, b)
+    } else {
+        l2_squared(a, b)
+    }
+}
+
 fn point(points: &[f32], dim: usize, i: usize) -> &[f32] {
     &points[i * dim..(i + 1) * dim]
 }
@@ -187,7 +224,7 @@ mod tests {
             .iter()
             .flat_map(|&c| [c - 0.5, c, c + 0.5])
             .collect();
-        let centroids = kmeans(&points, 1, 3, 20, 1);
+        let centroids = kmeans(&points, 1, 3, 20, 1, NonZeroUsize::MIN);
         assert_eq!(sorted_1d(&centroids), vec![0.0, 10.0, 20.0]);
     }
 
@@ -195,10 +232,24 @@ mod tests {
     fn same_seed_gives_the_same_centroids() {
         let mut rng = SplitMix64::new(5);
         let points: Vec<f32> = (0..2_000).map(|_| rng.next_f64() as f32).collect();
-        let a = kmeans(&points, 4, 16, 10, 9);
-        let b = kmeans(&points, 4, 16, 10, 9);
+        let a = kmeans(&points, 4, 16, 10, 9, NonZeroUsize::MIN);
+        let b = kmeans(&points, 4, 16, 10, 9, NonZeroUsize::MIN);
         assert_eq!(a, b);
-        assert_ne!(a, kmeans(&points, 4, 16, 10, 10), "the seed matters");
+        assert_ne!(
+            a,
+            kmeans(&points, 4, 16, 10, 10, NonZeroUsize::MIN),
+            "the seed matters"
+        );
+    }
+
+    #[test]
+    fn threads_do_not_change_the_centroids() {
+        // 40-d points take the SIMD path; 3000 of them span several chunks.
+        let mut rng = SplitMix64::new(6);
+        let points: Vec<f32> = (0..3_000 * 40).map(|_| rng.next_f64() as f32).collect();
+        let one = kmeans(&points, 40, 32, 5, 1, NonZeroUsize::MIN);
+        let many = kmeans(&points, 40, 32, 5, 1, NonZeroUsize::new(8).unwrap());
+        assert_eq!(one, many);
     }
 
     #[test]
@@ -246,7 +297,7 @@ mod tests {
         // Only two distinct values for four clusters: no centroid may be left
         // where no point is.
         let points = [1.0, 1.0, 1.0, 5.0, 5.0, 5.0];
-        let centroids = kmeans(&points, 1, 4, 10, 2);
+        let centroids = kmeans(&points, 1, 4, 10, 2, NonZeroUsize::MIN);
         assert!(
             centroids.iter().all(|c| [1.0, 5.0].contains(c)),
             "{centroids:?}"

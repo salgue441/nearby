@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail, ensure};
 use nearby_core::{Metric, PointId};
-use nearby_index::{FlatIndex, Hnsw, HnswParams, PqIndex, PqParams, ProductQuantizer, VectorIndex};
+use nearby_index::{
+    FlatIndex, Hnsw, HnswParams, IvfPqIndex, IvfPqParams, PqIndex, PqParams, ProductQuantizer,
+    VectorIndex,
+};
 
 use crate::dataset::{Dataset, Vectors};
 use crate::metrics::{LatencyStats, recall_at_k};
@@ -27,7 +30,7 @@ usage: nearby-bench [DATASET_DIR] [OPTIONS]
 
   DATASET_DIR              default: data/siftsmall
   --index LIST             indexes to benchmark, comma-separated: flat, hnsw, pq,
-                           or `both` (flat,hnsw) or `all` (default: both)
+                           ivfpq, or `both` (flat,hnsw) or `all` (default: both)
   --k N                    neighbors per query (default: 10)
   --m N                    HNSW links per node (default: 16)
   --ef-construction N      HNSW build quality (default: 200)
@@ -35,7 +38,9 @@ usage: nearby-bench [DATASET_DIR] [OPTIONS]
                            (a search uses at least k, so smaller values run as k)
   --pq-subspaces N         PQ code bytes per vector; must divide the dimension (default: 16)
   --pq-train N             base vectors PQ is trained on (default: 100000)
-  --threads N              threads that build HNSW and PQ (default: all available)";
+  --ivf-lists N            IVF-PQ lists (default: 1024)
+  --probe N,N,...          IVF-PQ lists to scan, one row per value (default: 1,2,4,8,16,32,64)
+  --threads N              threads that build HNSW, PQ and IVF-PQ (default: all available)";
 
 /// Base vectors read from disk at a time while building. Small enough to
 /// add no meaningful memory, large enough that timing each chunk is cheap.
@@ -43,10 +48,15 @@ const BUILD_CHUNK: usize = 4096;
 
 /// Which indexes to build and query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent flags, one per index"
+)]
 struct IndexSet {
     flat: bool,
     hnsw: bool,
     pq: bool,
+    ivfpq: bool,
 }
 
 impl IndexSet {
@@ -55,10 +65,11 @@ impl IndexSet {
         flat: true,
         hnsw: true,
         pq: false,
+        ivfpq: false,
     };
 
     /// Parses an `--index` value: a comma-separated list of `flat`, `hnsw`,
-    /// `pq`, `both` (flat and hnsw) and `all`.
+    /// `pq`, `ivfpq`, `both` (flat and hnsw) and `all`.
     ///
     /// # Errors
     ///
@@ -68,14 +79,18 @@ impl IndexSet {
             flat: false,
             hnsw: false,
             pq: false,
+            ivfpq: false,
         };
         for name in list.split(',').map(str::trim) {
             match name {
                 "flat" => set.flat = true,
                 "hnsw" => set.hnsw = true,
                 "pq" => set.pq = true,
+                "ivfpq" => set.ivfpq = true,
                 "both" => (set.flat, set.hnsw) = (true, true),
-                "all" => (set.flat, set.hnsw, set.pq) = (true, true, true),
+                "all" => {
+                    (set.flat, set.hnsw, set.pq, set.ivfpq) = (true, true, true, true);
+                }
                 other => bail!(
                     "unknown index `{other}`
 
@@ -100,6 +115,9 @@ struct Args {
     pq_subspaces: usize,
     /// How many base vectors, from the front of the file, train PQ.
     pq_train: usize,
+    ivf_lists: usize,
+    /// One IVF-PQ result row is reported per value.
+    probe: Vec<usize>,
     /// Threads that build the HNSW and PQ indexes.
     threads: NonZeroUsize,
 }
@@ -133,6 +151,9 @@ fn main() -> anyhow::Result<()> {
     }
     if args.indexes.pq {
         rows.extend(bench_pq(&data, &args)?);
+    }
+    if args.indexes.ivfpq {
+        rows.extend(bench_ivfpq(&data, &args)?);
     }
     print_rows(&rows, args.k);
     Ok(())
@@ -221,6 +242,44 @@ fn bench_pq(data: &Dataset, args: &Args) -> anyhow::Result<Vec<Row>> {
         "pq".to_owned(),
         run_queries(&pq, &data.queries, &data.truth, args.k)?,
     )])
+}
+
+/// Trains IVF-PQ on the front of the base file, encodes every base vector,
+/// then queries it once per `probe` value.
+fn bench_ivfpq(data: &Dataset, args: &Args) -> anyhow::Result<Vec<Row>> {
+    let training = data.read_base_prefix(args.pq_train)?;
+    let params = IvfPqParams {
+        pq: PqParams::with_subspaces(args.pq_subspaces),
+        lists: args.ivf_lists,
+        probe: 1,
+    };
+    let start = Instant::now();
+    let mut index = IvfPqIndex::train(
+        data.dim(),
+        Metric::L2,
+        &params,
+        &training.data,
+        args.threads,
+    )?;
+    let train_time = start.elapsed();
+    let training_len = training.len();
+    drop(training);
+
+    let encode_time = build(data, |batch| index.add_batch(batch, args.threads))?;
+    println!(
+        "build    ivfpq (lists={}, subspaces={}, threads={}): train {train_time:.2?} on \
+         {training_len} vectors, encode {encode_time:.2?}",
+        args.ivf_lists, args.pq_subspaces, args.threads
+    );
+    let mut rows = Vec::with_capacity(args.probe.len());
+    for &probe in &args.probe {
+        index.set_probe(probe);
+        rows.push((
+            format!("ivfpq probe={}", index.probe()),
+            run_queries(&index, &data.queries, &data.truth, args.k)?,
+        ));
+    }
+    Ok(rows)
 }
 
 /// Prints the results table.
@@ -346,6 +405,8 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
         ef_search: vec![10, 20, 40, 80, 160, 320],
         pq_subspaces: 16,
         pq_train: 100_000,
+        ivf_lists: 1024,
+        probe: vec![1, 2, 4, 8, 16, 32, 64],
         threads: default_threads(),
     };
     let mut it = raw.into_iter();
@@ -363,6 +424,13 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
             }
             "--pq-subspaces" => args.pq_subspaces = parse_number(&value("--pq-subspaces")?)?,
             "--pq-train" => args.pq_train = parse_number(&value("--pq-train")?)?,
+            "--ivf-lists" => args.ivf_lists = parse_number(&value("--ivf-lists")?)?,
+            "--probe" => {
+                args.probe = value("--probe")?
+                    .split(',')
+                    .map(parse_number)
+                    .collect::<anyhow::Result<_>>()?;
+            }
             "--threads" => {
                 args.threads = NonZeroUsize::new(parse_number(&value("--threads")?)?)
                     .context("--threads must be at least 1")?;
@@ -383,6 +451,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> anyhow::Result<Option<Ar
     ensure!(
         args.ef_search.iter().all(|&ef| ef > 0),
         "--ef values must be at least 1"
+    );
+    ensure!(
+        !args.probe.is_empty() && args.probe.iter().all(|&p| p > 0),
+        "--probe values must be at least 1"
     );
     Ok(Some(args))
 }
@@ -425,6 +497,8 @@ mod tests {
                 ef_search: vec![10, 20, 40, 80, 160, 320],
                 pq_subspaces: 16,
                 pq_train: 100_000,
+                ivf_lists: 1024,
+                probe: vec![1, 2, 4, 8, 16, 32, 64],
                 threads: default_threads(),
             }
         );
@@ -448,6 +522,10 @@ mod tests {
             "32",
             "--pq-train",
             "5000",
+            "--ivf-lists",
+            "64",
+            "--probe",
+            "1,8",
             "--ef",
             "50, 100,200",
         ])
@@ -459,13 +537,15 @@ mod tests {
             IndexSet {
                 flat: false,
                 hnsw: true,
-                pq: false
+                pq: false,
+                ivfpq: false,
             }
         );
         assert_eq!((args.k, args.m, args.ef_construction), (100, 32, 400));
         assert_eq!(args.ef_search, vec![50, 100, 200]);
         assert_eq!(args.threads.get(), 3);
         assert_eq!((args.pq_subspaces, args.pq_train), (32, 5000));
+        assert_eq!((args.ivf_lists, args.probe), (64, vec![1, 8]));
     }
 
     #[test]
@@ -482,16 +562,18 @@ mod tests {
             flat: true,
             hnsw: true,
             pq: true,
+            ivfpq: true,
         };
         assert_eq!(set("all"), all);
-        assert_eq!(set("pq, both"), all);
+        assert_eq!(set("pq, ivfpq, both"), all);
         assert_eq!(set("both"), IndexSet::BOTH);
         assert_eq!(
             set("pq"),
             IndexSet {
                 flat: false,
                 hnsw: false,
-                pq: true
+                pq: true,
+                ivfpq: false,
             }
         );
     }
@@ -504,7 +586,7 @@ mod tests {
 
     #[test]
     fn errors_explain_the_problem() {
-        let cases: [(&[&str], &str); 11] = [
+        let cases: [(&[&str], &str); 12] = [
             (&["--index", "ivf"], "unknown index `ivf`"),
             (&["--index", "flat,,pq"], "unknown index ``"),
             (&["--pq-train"], "--pq-train needs a value"),
@@ -516,6 +598,7 @@ mod tests {
             (&["--ef", "10,,20"], "`` is not"),
             (&["--ef", "10,0"], "--ef values must be at least 1"),
             (&["--threads", "0"], "--threads must be at least 1"),
+            (&["--probe", "4,0"], "--probe values must be at least 1"),
         ];
         for (args, expected) in cases {
             let err = format!("{:#}", parse(args).unwrap_err());

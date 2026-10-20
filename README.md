@@ -216,10 +216,12 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
 - **PQ collections.** A quantizer needs data to train on, so a `pq`
   collection searches exactly until `training_points` points (default
   10,000) have been written, then trains on them and encodes every point.
-  Each search then scans the codes for `rerank * k` candidates (default
-  `rerank = 10`) and returns the best `k` by exact distance, reading the
-  candidates' full vectors from a memory-mapped scratch file. On SIFT1M
-  with 16 subspaces:
+  The codes are grouped into `lists` clusters (default 256; 0 turns this
+  off), and each search scans the `probe` clusters nearest the query
+  (default 16) for `rerank * k` candidates (default `rerank = 10`), then
+  returns the best `k` by exact distance, reading the candidates' full
+  vectors from a memory-mapped scratch file. On SIFT1M with 16 subspaces,
+  scanning every code (`lists = 0`):
 
   | `rerank` | recall@10 |
   |---|---|
@@ -229,11 +231,19 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   | 20 | 0.9906 |
   | 50 | 0.9984 |
 
-  Searches take about 10 ms either way, since scanning a million codes
-  dominates. Loading the million points takes 15 s (HNSW: 90 s), and a PQ
-  collection isn't snapshotted: each start retrains, which takes 6 s here.
-  HNSW searches are much faster, so PQ is for when build time or index
-  memory matters more than latency.
+  Those searches take about 10 ms whatever `rerank` is, since scanning a
+  million codes dominates. Clusters cut that down (`rerank = 10`):
+
+  | `lists` / `probe` | recall@10 | Mean latency |
+  |---|---|---|
+  | 0 (scan every code) | 0.9654 | 9.7 ms |
+  | 256 / 8 | 0.9036 | 0.49 ms |
+  | **256 / 16 (default)** | **0.9500** | **0.80 ms** |
+  | 256 / 32 | 0.9636 | 1.43 ms |
+  | 1024 / 64, 50,000 training points | 0.9673 | 0.82 ms |
+
+  Loading the million points takes 18 s (HNSW: 90 s). HNSW still searches
+  faster at higher recall; PQ is for when build time or memory matters more.
 - **Memory.** Each vector is held once: by the index for flat and HNSW
   collections, and for PQ in the scratch file, which the OS caches as
   memory allows, so only the 16-byte codes stay in the process. With SIFT1M
@@ -330,7 +340,7 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 </details>
 
 <details>
-<summary><b>Compressed search: <code>PqIndex</code></b></summary>
+<summary><b>Compressed search: <code>PqIndex</code> and <code>IvfPqIndex</code></b></summary>
 
 `PqIndex` implements product quantization (Jégou, Douze & Schmid, 2011).
 Each vector is split into `subspaces` equal slices, and each slice is replaced
@@ -352,8 +362,14 @@ index.add_batch(&points, threads)?;
   costs one lookup per subspace, summed into four independent accumulators.
 - **Metrics.** L2 and dot product are approximated directly; cosine works on
   normalized vectors.
-- Only codes and ids are stored, so results can't be re-ranked with exact
-  distances yet.
+- Only codes and ids are stored. Collections re-rank candidates with exact
+  distances (see the engine section).
+- **IVF-PQ.** `IvfPqIndex` also groups the codes by their nearest of
+  `lists` coarse centroids (k-means on the training vectors), and a search
+  scans only the `probe` lists nearest the query. Codes encode the vectors
+  themselves, not their offsets from the centroid, so one distance table
+  serves every list; probing every list returns exactly what `PqIndex`
+  does.
 
 SIFT1M, 100k training vectors, 10k queries, 16 threads:
 
@@ -362,12 +378,17 @@ SIFT1M, 100k training vectors, 10k queries, 16 threads:
 | `FlatIndex` | 512 | 0.9994 | 30.4 ms | – |
 | `PqIndex`, 16 subspaces | 16 | 0.5452 | 7.4 ms | 7.7 s + 6.2 s |
 | `PqIndex`, 32 subspaces | 32 | 0.7215 | 14.4 ms | 9.9 s + 8.8 s |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 8 | 16 | 0.5074 | 0.11 ms | 17.5 s + 9.0 s |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 16 | 16 | 0.5327 | 0.18 ms | |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 64 | 16 | 0.5448 | 0.62 ms | |
 
 | Parameter | Default | Effect |
 |---|---|---|
 | `subspaces` | 16 | Code bytes per vector; must divide the dimension. More: better recall, more memory, slower searches. |
 | `iterations` | 25 | Maximum k-means iterations per subspace. |
 | `seed` | `0x5EED` | Seed for k-means++ seeding. |
+| `lists` (IVF-PQ) | 256 | Coarse clusters. Around `sqrt(n)` for `n` vectors; each needs a few dozen training vectors. |
+| `probe` (IVF-PQ) | 16 | Clusters a search scans. More: higher recall, slower searches. `set_probe` changes it without retraining. |
 
 </details>
 
@@ -430,13 +451,15 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | Option | Default | Meaning |
 |---|---|---|
 | `DATASET_DIR` | `data/siftsmall` | Dataset directory. |
-| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. |
+| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, `ivfpq`, or `both` (flat and hnsw) or `all`. |
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
 | `--pq-subspaces N` | `16` | PQ code bytes per vector. Must divide the dimension. |
 | `--pq-train N` | `100000` | Base vectors, from the front of the file, that PQ is trained on. |
-| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ. Results are the same for any value. |
+| `--ivf-lists N` | `1024` | IVF-PQ clusters. |
+| `--probe N,N,...` | `1,2,4,8,16,32,64` | IVF-PQ clusters each search scans; one result row per value. |
+| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ and IVF-PQ. Results are the same for any value. |
 | `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, one result row each. Values below `k` run as `k`, and each row is labeled with the `ef` it actually used. |
 | `-h`, `--help` | | Print usage. |
 
@@ -505,7 +528,7 @@ requests and flushes every collection before exiting.
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
   `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
   `ef_construction` and `ef_search`) or `{"type": "pq"}` (optionally with
-  `subspaces`, `training_points` and `rerank`). Names are 1 to 64 ASCII letters,
+  `subspaces`, `training_points`, `rerank`, `lists` and `probe`). Names are 1 to 64 ASCII letters,
   digits, `-` or `_`.
 - **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
   for a missing collection or point, `409` for a name that's taken, `413`

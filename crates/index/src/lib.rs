@@ -18,7 +18,7 @@ mod store;
 
 pub use flat::FlatIndex;
 pub use hnsw::{Hnsw, HnswParams};
-pub use pq::{PqIndex, PqParams, ProductQuantizer};
+pub use pq::{IvfPqIndex, IvfPqParams, PqIndex, PqParams, ProductQuantizer};
 
 /// What every index can do once it's built.
 ///
