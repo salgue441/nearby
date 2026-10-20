@@ -557,6 +557,37 @@ the largest single index.
 
 </details>
 
+### Micro-benchmarks
+
+`nearby-bench` measures whole datasets. For the hot paths on their own,
+there are [Criterion](https://github.com/bheisler/criterion.rs) benchmarks:
+
+```sh
+cargo bench -p nearby-core --bench distance      # distance kernels, 128 to 1536 dimensions
+cargo bench -p nearby-index --bench search       # each index's search, HNSW build, PQ encode
+cargo bench -p nearby-engine --bench collection  # batched writes, filtered searches
+```
+
+On a 16-thread i7-11800H (Linux container), medians:
+
+| Benchmark | Time |
+|---|---:|
+| `dot` / `l2_squared`, 768-d | 37 ns (20 G elements/s) |
+| `cosine`, 768-d | 113 ns |
+| Search 20k × 128-d, k = 10: flat | 332 µs |
+| Search 20k × 128-d, k = 10: HNSW, `ef` 64 | 55 µs |
+| Search 20k × 128-d, k = 10: PQ | 160 µs |
+| Search 20k × 128-d, k = 10: IVF-PQ, 128 lists, probe 8 | 25 µs |
+| Build 5k × 128-d: HNSW `insert_batch` | 151 ms |
+| Build 5k × 128-d: PQ encode | 21 ms |
+| Upsert 1,000 points with payloads (no sync): flat | 1.2 ms |
+| Upsert 1,000 points with payloads (no sync): HNSW | 24 ms |
+| HNSW search 20k × 64-d: no filter | 46 µs |
+| HNSW search 20k × 64-d: filter keeps 50% | 159 µs |
+| HNSW search 20k × 64-d: filter keeps 10% | 604 µs |
+| HNSW search 20k × 64-d: filter keeps 1% | 2.8 ms |
+| `Filter::matches` (a range and an equality) | 20 ns |
+
 ## Server
 
 ```sh
