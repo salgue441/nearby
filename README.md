@@ -358,7 +358,10 @@ hnsw ef=10           ...       ...        ...        ...        ...        ...  
   construction; the line also reports the number of layers.
 - **recall@k**: the average fraction of each query's true `k` nearest
   neighbors found among the first `k` results. The flat index is exact, so
-  anything below 1.0000 there is a bug.
+  it only falls short of 1.0000 on ties: when several vectors are exactly as
+  far as the `k`-th neighbor, it keeps the lowest ids, which may not be the
+  ones the ground truth lists. SIFT1M has duplicate vectors, so its flat
+  recall is 0.9994; every miss there is such a tie.
 - **qps**: queries per second, run one after another on a single thread.
 - **mean … max**: per-query latency, with nearest-rank percentiles. Tail
   latencies (p95, p99) are what the slowest requests experience.
