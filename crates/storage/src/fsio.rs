@@ -1,7 +1,7 @@
 //! Durable file replacement.
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use nearby_core::Result;
@@ -15,9 +15,26 @@ use nearby_core::Result;
 /// If writing, syncing or renaming fails. A leftover temporary file is
 /// harmless; [`crate::CollectionStore::open`] removes it.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, |w| Ok(w.write_all(bytes)?))
+}
+
+/// Like [`atomic_write`], but streams the contents: `write` fills a buffered
+/// writer to the temporary file. For files too large to build in memory.
+///
+/// # Errors
+///
+/// If `write` fails, or writing, syncing or renaming does. `path` is left
+/// untouched then.
+pub fn atomic_write_with(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<File>) -> Result<()>,
+) -> Result<()> {
     let tmp = path.with_extension("tmp");
-    let mut file = File::create(&tmp)?;
-    file.write_all(bytes)?;
+    let mut writer = BufWriter::new(File::create(&tmp)?);
+    write(&mut writer)?;
+    let file = writer
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&tmp, path)?;

@@ -11,6 +11,7 @@ use crate::EngineOptions;
 use crate::backend::{IndexBackend, new_index};
 use crate::config::CollectionConfig;
 use crate::points::PointTable;
+use crate::snapshot;
 
 /// The config's file name inside a collection directory.
 const CONFIG_FILE: &str = "collection.toml";
@@ -36,6 +37,8 @@ pub struct Collection {
     points: PointTable,
     /// Indexes slots, not point ids: a point's id is `points.live_id(slot)`.
     index: Box<dyn IndexBackend>,
+    /// The storage generation of the snapshot on disk, if one is current.
+    snapshot_generation: Option<u64>,
 }
 
 /// A summary of a collection, for listing and monitoring.
@@ -77,6 +80,7 @@ impl Collection {
             options,
             store,
             index,
+            snapshot_generation: None,
         })
     }
 
@@ -86,8 +90,15 @@ impl Collection {
     }
 
     /// Opens the collection in `dir`: replays its storage and rebuilds its index.
+    ///
+    /// If a snapshot taken at the current storage generation exists, it is
+    /// loaded instead, and only the log written since is replayed.
     pub(crate) fn open(dir: &Path, name: &str, options: EngineOptions) -> Result<Self> {
         let config = CollectionConfig::read(&dir.join(CONFIG_FILE))?;
+        let generation = CollectionStore::read_generation(dir)?;
+        if let Some((points, index)) = snapshot::load(dir, &config, generation) {
+            return Self::open_from_snapshot(dir, name, config, options, points, index);
+        }
         let mut points = PointTable::new(config.dim);
         let store = CollectionStore::open(dir, store_options(&options), |op| match op {
             Op::Upsert { id, vector } => {
@@ -97,16 +108,7 @@ impl Collection {
                 points.delete(id);
             }
         })?;
-        if store.dim() != config.dim {
-            return Err(Error::corruption(
-                dir,
-                format!(
-                    "storage holds {}-d vectors but the config says {}",
-                    store.dim(),
-                    config.dim
-                ),
-            ));
-        }
+        check_dim(&store, &config)?;
         let mut collection = Self {
             name: name.to_owned(),
             index: new_index(&config, 0)?,
@@ -114,9 +116,62 @@ impl Collection {
             options,
             store,
             points,
+            snapshot_generation: None,
         };
         collection.rebuild_index()?;
         Ok(collection)
+    }
+
+    /// Opens a collection whose state at the current storage generation is
+    /// `points` and `index`, replaying the log written since on top.
+    fn open_from_snapshot(
+        dir: &Path,
+        name: &str,
+        config: CollectionConfig,
+        options: EngineOptions,
+        points: PointTable,
+        index: Box<dyn IndexBackend>,
+    ) -> Result<Self> {
+        let mut logged = Vec::new();
+        let store = CollectionStore::open_log_only(dir, store_options(&options), |op| {
+            logged.push(Logged::from(op));
+        })?;
+        check_dim(&store, &config)?;
+        let mut collection = Self {
+            name: name.to_owned(),
+            snapshot_generation: Some(store.generation()),
+            config,
+            options,
+            store,
+            points,
+            index,
+        };
+        collection.apply_logged(&logged)?;
+        tracing::info!(
+            collection = %name,
+            points = collection.len(),
+            replayed = logged.len(),
+            "restored the index from a snapshot"
+        );
+        Ok(collection)
+    }
+
+    /// Applies ops replayed from the log, which are already durable, to the
+    /// in-memory state.
+    fn apply_logged(&mut self, ops: &[Logged]) -> Result<()> {
+        let mut inserted: Vec<(PointId, &[f32])> = Vec::new();
+        for op in ops {
+            match op {
+                Logged::Upsert(id, vector) => {
+                    let slot = self.points.upsert(*id, vector);
+                    inserted.push((u64::from(slot), vector));
+                }
+                Logged::Delete(id) => {
+                    self.points.delete(*id);
+                }
+            }
+        }
+        self.index.insert_batch(&inserted, self.options.threads)
     }
 
     /// The collection's name.
@@ -244,14 +299,48 @@ impl Collection {
     ///
     /// An I/O error.
     pub fn flush(&mut self) -> Result<()> {
-        self.store.flush()
+        self.store.flush()?;
+        if self
+            .snapshot_generation
+            .is_some_and(|g| g != self.store.generation())
+        {
+            // Stale now, and would be ignored anyway: reclaim the space.
+            snapshot::remove(self.store.dir());
+            self.snapshot_generation = None;
+        }
+        Ok(())
+    }
+
+    /// Flushes the log and, for an HNSW collection, saves a snapshot of the
+    /// index, so the next open loads it instead of rebuilding. Called on
+    /// shutdown.
+    ///
+    /// # Errors
+    ///
+    /// An I/O error. The collection stays consistent either way: the
+    /// snapshot is only a cache.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        self.store.flush()?;
+        let generation = self.store.generation();
+        if self.snapshot_generation == Some(generation) {
+            return Ok(());
+        }
+        if snapshot::save(
+            self.store.dir(),
+            generation,
+            &self.points,
+            self.index.as_ref(),
+        )? {
+            self.snapshot_generation = Some(generation);
+        }
+        Ok(())
     }
 
     /// Housekeeping after a write: flushes a long log, compacts when
     /// segments pile up, and rebuilds the index when it is mostly dead.
     fn maintain(&mut self) -> Result<()> {
         if self.store.wal_ops() >= self.options.flush_after_ops {
-            self.store.flush()?;
+            self.flush()?;
             if self.store.segment_count() > self.options.max_segments {
                 self.store.compact()?;
             }
@@ -277,6 +366,37 @@ impl Collection {
         self.index = index;
         Ok(())
     }
+}
+
+/// An op replayed from the log, owned so it outlives the replay callback.
+#[derive(Debug)]
+enum Logged {
+    Upsert(PointId, Vec<f32>),
+    Delete(PointId),
+}
+
+impl From<Op<'_>> for Logged {
+    fn from(op: Op<'_>) -> Self {
+        match op {
+            Op::Upsert { id, vector } => Self::Upsert(id, vector.to_vec()),
+            Op::Delete { id } => Self::Delete(id),
+        }
+    }
+}
+
+/// Checks that storage and config agree on the dimension.
+fn check_dim(store: &CollectionStore, config: &CollectionConfig) -> Result<()> {
+    if store.dim() == config.dim {
+        return Ok(());
+    }
+    Err(Error::corruption(
+        store.dir(),
+        format!(
+            "storage holds {}-d vectors but the config says {}",
+            store.dim(),
+            config.dim
+        ),
+    ))
 }
 
 fn store_options(options: &EngineOptions) -> StoreOptions {
@@ -421,6 +541,79 @@ mod tests {
         );
         assert_eq!(c.index.len(), 1_000);
         assert_eq!(ids(&c.search(&[0.0, 1.0], 1).unwrap()), vec![2_000]);
+    }
+
+    fn hnsw() -> IndexConfig {
+        IndexConfig::Hnsw(HnswConfig::default())
+    }
+
+    #[test]
+    fn a_checkpoint_lets_reopening_skip_the_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Collection::create(dir.path(), "c", config(hnsw()), options()).unwrap();
+        c.upsert(&[(1, &[0.0, 0.0]), (2, &[1.0, 1.0]), (3, &[2.0, 2.0])])
+            .unwrap();
+        c.upsert(&[(2, &[5.0, 5.0])]).unwrap();
+        c.delete(&[3]).unwrap();
+        c.checkpoint().unwrap();
+        let before = c.search(&[0.0, 0.0], 10).unwrap();
+        drop(c);
+        assert!(dir.path().join("index.snapshot").is_file());
+
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert!(c.snapshot_generation.is_some(), "loaded from the snapshot");
+        assert_eq!(c.search(&[0.0, 0.0], 10).unwrap(), before);
+        assert_eq!(c.get(2), Some(&[5.0, 5.0][..]));
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn writes_after_a_checkpoint_are_replayed_onto_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Collection::create(dir.path(), "c", config(hnsw()), options()).unwrap();
+        c.upsert(&[(1, &[1.0, 1.0]), (2, &[2.0, 2.0])]).unwrap();
+        c.checkpoint().unwrap();
+        // Then a crash: these reach only the log.
+        c.upsert(&[(3, &[3.0, 3.0]), (1, &[9.0, 9.0])]).unwrap();
+        c.delete(&[2]).unwrap();
+        drop(c);
+
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert!(c.snapshot_generation.is_some(), "loaded from the snapshot");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.get(1), Some(&[9.0, 9.0][..]));
+        assert_eq!(c.get(2), None);
+        assert_eq!(ids(&c.search(&[3.0, 3.0], 5).unwrap()), vec![3, 1]);
+    }
+
+    #[test]
+    fn a_flush_after_a_checkpoint_retires_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Collection::create(dir.path(), "c", config(hnsw()), options()).unwrap();
+        c.upsert(&[(1, &[1.0, 1.0])]).unwrap();
+        c.checkpoint().unwrap();
+        c.upsert(&[(2, &[2.0, 2.0])]).unwrap();
+        c.flush().unwrap();
+        assert!(
+            !dir.path().join("index.snapshot").exists(),
+            "stale, so removed"
+        );
+        drop(c);
+
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert!(c.snapshot_generation.is_none(), "rebuilt instead");
+        assert_eq!(c.len(), 2);
+    }
+
+    #[test]
+    fn flat_collections_checkpoint_without_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c =
+            Collection::create(dir.path(), "c", config(IndexConfig::Flat), options()).unwrap();
+        c.upsert(&[(1, &[1.0, 1.0])]).unwrap();
+        c.checkpoint().unwrap();
+        assert!(!dir.path().join("index.snapshot").exists());
+        assert_eq!(c.info().wal_ops, 0);
     }
 
     #[test]

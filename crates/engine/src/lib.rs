@@ -20,6 +20,7 @@ mod collection;
 mod config;
 mod database;
 mod points;
+mod snapshot;
 
 use std::num::NonZeroUsize;
 

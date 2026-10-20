@@ -94,6 +94,36 @@ impl PointTable {
             .map(|slot| (slot, self.vector(slot)))
     }
 
+    /// Every slot's point id and whether it is live, in slot order.
+    pub(crate) fn slots(&self) -> impl Iterator<Item = (PointId, bool)> {
+        self.ids.iter().copied().zip(self.live.iter().copied())
+    }
+
+    /// Rebuilds a table from [`PointTable::slots`] and each slot's vector.
+    ///
+    /// # Panics
+    ///
+    /// If `vectors` doesn't yield one `dim`-long vector per slot.
+    pub(crate) fn from_slots<'a>(
+        dim: usize,
+        slots: &[(PointId, bool)],
+        vectors: impl Iterator<Item = &'a [f32]>,
+    ) -> Self {
+        let mut table = Self::new(dim);
+        for (&(id, live), vector) in slots.iter().zip(vectors) {
+            assert_eq!(vector.len(), dim, "vectors must have the table's dimension");
+            let slot = u32::try_from(table.ids.len()).expect("fewer than 2^32 slots");
+            table.vectors.extend_from_slice(vector);
+            table.ids.push(id);
+            table.live.push(live);
+            if live {
+                table.slots.insert(id, slot);
+            }
+        }
+        assert_eq!(table.ids.len(), slots.len(), "one vector per slot");
+        table
+    }
+
     /// A table with the same live points and no dead slots. Points keep
     /// their relative order, so slot `s` here is the `s`-th live slot there.
     pub(crate) fn compacted(&self) -> Self {
@@ -145,6 +175,22 @@ mod tests {
         let ids: Vec<PointId> = (0..4).map(|s| c.live_id(s).unwrap()).collect();
         assert_eq!(ids, vec![0, 2, 4, 3]);
         assert_eq!(c.get(3), Some(&[30.0][..]));
+    }
+
+    #[test]
+    fn slots_round_trip_through_from_slots() {
+        let mut t = PointTable::new(1);
+        t.upsert(1, &[1.0]);
+        t.upsert(2, &[2.0]);
+        t.upsert(1, &[3.0]);
+        t.delete(2);
+        let slots: Vec<(PointId, bool)> = t.slots().collect();
+        assert_eq!(slots, vec![(1, false), (2, false), (1, true)]);
+        let vectors = [[1.0], [2.0], [3.0]];
+        let r = PointTable::from_slots(1, &slots, vectors.iter().map(|v| &v[..]));
+        assert_eq!((r.len(), r.dead()), (1, 2));
+        assert_eq!(r.get(1), Some(&[3.0][..]));
+        assert_eq!(r.live_id(2), Some(1));
     }
 
     #[test]

@@ -148,17 +148,18 @@ impl Database {
         Ok(())
     }
 
-    /// Flushes every collection's log into a segment, for a quick restart.
+    /// Checkpoints every collection (see [`Collection::checkpoint`]): flushes
+    /// its log and saves HNSW indexes, so the next start is quick.
     ///
     /// # Errors
     ///
-    /// The first I/O error; the remaining collections are still flushed.
-    pub fn flush_all(&self) -> Result<()> {
+    /// The first I/O error; the remaining collections are still checkpointed.
+    pub fn checkpoint_all(&self) -> Result<()> {
         let mut first_error = None;
         for handle in self.read_map().values() {
             let mut collection = handle.write().unwrap_or_else(PoisonError::into_inner);
-            if let Err(err) = collection.flush() {
-                tracing::error!(collection = %collection.name(), %err, "flush failed");
+            if let Err(err) = collection.checkpoint() {
+                tracing::error!(collection = %collection.name(), %err, "checkpoint failed");
                 first_error.get_or_insert(err);
             }
         }
@@ -285,14 +286,14 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_moves_every_log_into_a_segment() {
+    fn checkpoint_all_moves_every_log_into_a_segment() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(dir.path(), options()).unwrap();
         for name in ["a", "b"] {
             let c = db.create_collection(name, config(2)).unwrap();
             c.write().unwrap().upsert(&[(1, &[1.0, 1.0])]).unwrap();
         }
-        db.flush_all().unwrap();
+        db.checkpoint_all().unwrap();
         for name in ["a", "b"] {
             let info = db.collection(name).unwrap().read().unwrap().info();
             assert_eq!((info.wal_ops, info.segments), (0, 1));

@@ -24,6 +24,6 @@ mod segment;
 mod store;
 mod wal;
 
-pub use fsio::atomic_write;
+pub use fsio::{atomic_write, atomic_write_with};
 pub use store::{CollectionStore, StoreOptions};
 pub use wal::{Durability, Op};
