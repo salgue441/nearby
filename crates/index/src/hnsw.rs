@@ -294,6 +294,30 @@ impl VectorIndex for Hnsw {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+        // Not the default, which goes through `search_filtered`: with a filter
+        // known to keep everything, the check compiles away instead of costing
+        // an extra memory read per visited node.
+        self.search_admitting(query, k, |_| true)
+    }
+
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: &dyn Fn(PointId) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
+        self.search_admitting(query, k, |node| keep(self.ids[node as usize]))
+    }
+}
+
+impl Hnsw {
+    /// Searches for the `k` nodes closest to `query` among those `admit` accepts.
+    fn search_admitting(
+        &self,
+        query: &[f32],
+        k: usize,
+        admit: impl Fn(u32) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.store.dim())?;
         let Some(entry) = self.entry_point else {
             return Ok(Vec::new());
@@ -310,7 +334,7 @@ impl VectorIndex for Hnsw {
             ep = ctx.greedy_closest(&query, ep, l, &mut visited);
         }
         let ef = self.params.ef_search.max(k);
-        let found = ctx.search_layer(&query, &[ep], ef, 0, &mut visited);
+        let found = ctx.search_layer_filtered(&query, &[ep], ef, 0, &mut visited, admit);
         self.return_visited(visited);
 
         Ok(found
