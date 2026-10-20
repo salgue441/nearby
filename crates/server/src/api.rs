@@ -11,6 +11,7 @@
 //! | `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": n}` |
 //! | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
 //! | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.5, "payload": {...}}]}` |
+//! | `POST` | `/collections/{name}/search/batch` | `{"searches": [search, ...]}` | `{"results": [[...], ...]}` |
 //!
 //! Payloads are optional objects of booleans, numbers and strings; filters
 //! are described on `nearby_engine::Filter`.
@@ -19,6 +20,7 @@
 //! API key configured, every endpoint but `/health` requires
 //! `Authorization: Bearer <key>` and answers `401` without it.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, PoisonError};
 
 use axum::extract::rejection::JsonRejection;
@@ -29,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use nearby_core::{Error, PointId};
-use nearby_engine::{CollectionConfig, CollectionInfo, Database, Filter, Payload};
+use nearby_engine::{Collection, CollectionConfig, CollectionInfo, Database, Filter, Payload};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -37,6 +39,9 @@ use crate::auth::{ApiKey, require_api_key};
 
 /// Largest `k` a search may ask for.
 const MAX_K: usize = 10_000;
+
+/// Most searches one batch request may hold.
+const MAX_BATCH: usize = 1024;
 
 /// Shared state of every handler.
 type Db = Arc<Database>;
@@ -54,7 +59,8 @@ pub fn router(db: Db, options: ApiOptions) -> Router {
         .route("/collections/{name}/points", put(upsert_points))
         .route("/collections/{name}/points/delete", post(delete_points))
         .route("/collections/{name}/points/{id}", get(get_point))
-        .route("/collections/{name}/search", post(search));
+        .route("/collections/{name}/search", post(search))
+        .route("/collections/{name}/search/batch", post(search_batch));
     if let Some(key) = options.api_key {
         api = api.route_layer(middleware::from_fn_with_state(key, require_api_key));
     }
@@ -230,21 +236,85 @@ async fn search(
     let results = blocking(move || {
         let handle = db.collection(&name)?;
         let collection = handle.read().unwrap_or_else(PoisonError::into_inner);
-        let hits = collection.search_where(&request.vector, request.k, request.filter.as_ref())?;
-        Ok(hits
-            .into_iter()
-            .map(|p| Hit {
-                id: p.id,
-                distance: p.distance,
-                payload: request
-                    .with_payload
-                    .then(|| collection.payload(p.id).cloned())
-                    .flatten(),
-            })
-            .collect())
+        run_search(&collection, &request)
     })
     .await?;
     Ok(Json(SearchResponse { results }))
+}
+
+/// Runs one search request against `collection`.
+fn run_search(collection: &Collection, request: &SearchRequest) -> nearby_core::Result<Vec<Hit>> {
+    let hits = collection.search_where(&request.vector, request.k, request.filter.as_ref())?;
+    Ok(hits
+        .into_iter()
+        .map(|p| Hit {
+            id: p.id,
+            distance: p.distance,
+            payload: request
+                .with_payload
+                .then(|| collection.payload(p.id).cloned())
+                .flatten(),
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchSearchRequest {
+    searches: Vec<SearchRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchSearchResponse {
+    /// One list of hits per search, in request order.
+    results: Vec<Vec<Hit>>,
+}
+
+/// Runs many searches in one request, in parallel, under one read lock.
+async fn search_batch(
+    State(db): State<Db>,
+    Path(name): Path<String>,
+    ApiJson(request): ApiJson<BatchSearchRequest>,
+) -> Result<Json<BatchSearchResponse>, ApiError> {
+    let searches = request.searches;
+    if searches.len() > MAX_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "a batch holds at most {MAX_BATCH} searches, got {}",
+            searches.len()
+        )));
+    }
+    if let Some(i) = searches.iter().position(|s| s.k > MAX_K) {
+        return Err(ApiError::bad_request(format!(
+            "search {i}: k must be at most {MAX_K}"
+        )));
+    }
+    let results = blocking(move || {
+        let handle = db.collection(&name)?;
+        let collection = handle.read().unwrap_or_else(PoisonError::into_inner);
+        let threads = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let chunk = searches.len().div_ceil(threads).max(1);
+        let collection = &*collection;
+        let per_chunk: Vec<Vec<nearby_core::Result<Vec<Hit>>>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = searches
+                .chunks(chunk)
+                .map(|chunk| {
+                    scope.spawn(move || chunk.iter().map(|s| run_search(collection, s)).collect())
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("search threads don't panic"))
+                .collect()
+        });
+        Ok(per_chunk.into_iter().flatten().collect::<Vec<_>>())
+    })
+    .await?;
+    let results = results
+        .into_iter()
+        .enumerate()
+        .map(|(i, hits)| hits.map_err(|err| ApiError::from(err).context(&format!("search {i}"))))
+        .collect::<Result<_, _>>()?;
+    Ok(Json(BatchSearchResponse { results }))
 }
 
 /// Runs engine work, which can take a while (an fsync, an index build), on
@@ -282,6 +352,14 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message,
+        }
+    }
+
+    /// The same error, its message prefixed with what it concerns.
+    fn context(self, context: &str) -> Self {
+        Self {
+            message: format!("{context}: {}", self.message),
+            ..self
         }
     }
 }
@@ -582,6 +660,67 @@ mod tests {
             body["error"].as_str().unwrap().contains("exactly one"),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_searches_answer_like_single_ones_in_order() {
+        let server = TestServer::new();
+        server.create_docs().await;
+        let points: Vec<Value> = (0..50)
+            .map(|i| json!({ "id": i, "vector": [i, 0], "payload": { "even": i % 2 == 0 } }))
+            .collect();
+        server
+            .send(
+                Method::PUT,
+                "/collections/docs/points",
+                Some(json!({ "points": points })),
+            )
+            .await;
+        let searches: Vec<Value> = (0..20)
+            .map(|i| {
+                let mut search = json!({ "vector": [i * 2, 0], "k": 3 });
+                if i % 3 == 0 {
+                    search["filter"] = json!({ "field": "even", "eq": false });
+                }
+                search
+            })
+            .collect();
+        let (status, batch) = server
+            .send(
+                Method::POST,
+                "/collections/docs/search/batch",
+                Some(json!({ "searches": searches })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        for (i, search) in searches.into_iter().enumerate() {
+            let (_, single) = server
+                .send(Method::POST, "/collections/docs/search", Some(search))
+                .await;
+            assert_eq!(batch["results"][i], single["results"], "search {i}");
+        }
+
+        let bad = json!({ "searches": [{ "vector": [0, 0] }, { "vector": [0] }] });
+        let (status, body) = server
+            .send(Method::POST, "/collections/docs/search/batch", Some(bad))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body["error"].as_str().unwrap().starts_with("search 1:"),
+            "{body}"
+        );
+
+        let many: Vec<Value> = (0..=MAX_BATCH)
+            .map(|_| json!({ "vector": [0, 0] }))
+            .collect();
+        let (status, _) = server
+            .send(
+                Method::POST,
+                "/collections/docs/search/batch",
+                Some(json!({ "searches": many })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
