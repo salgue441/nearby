@@ -4,8 +4,9 @@
 
 **A vector database in Rust, built from first principles.**
 
-Exact and approximate nearest-neighbor search, SIMD distance kernels, and a
-benchmark harness that keeps every optimization honest.
+Exact, graph and compressed nearest-neighbor search, a crash-safe storage
+engine, an HTTP API, and a benchmark harness that keeps every optimization
+honest.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: stable, 2024 edition](https://img.shields.io/badge/rust-stable%20%C2%B7%202024%20edition-orange.svg)](rust-toolchain.toml)
@@ -17,6 +18,9 @@ benchmark harness that keeps every optimization honest.
 
 ## Highlights
 
+- **A complete database.** Named collections with upserts, deletes and
+  search over an HTTP + JSON API, kept durable by a checksummed write-ahead
+  log and immutable segments, and recovered exactly after a crash.
 - **Exact and approximate search behind one trait.** `FlatIndex` is always
   correct; `Hnsw` answers about 30× faster at 99% recall on 200k vectors
   ([synthetic data](#performance)).
@@ -43,7 +47,26 @@ benchmark harness that keeps every optimization honest.
 
 ## Quick start
 
-Nearby isn't on crates.io yet. Depend on the crates by path (or git):
+Run the server (it stores data in `./data` and listens on `127.0.0.1:7700`):
+
+```sh
+cargo run -p nearby-server --release
+```
+
+Then create a collection, add points and search:
+
+```sh
+curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \n  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
+
+curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \n  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
+                  {"id": 3, "vector": [0.9, 0.1, 0]}]}'
+
+curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \n  -d '{"vector": [1, 0.05, 0], "k": 2}'
+# {"results":[{"id":1,"distance":0.0012476444},{"id":3,"distance":0.0018416047}]}
+```
+
+The indexes can also be used directly as a library. Nearby isn't on crates.io
+yet, so depend on the crates by path (or git):
 
 ```toml
 [dependencies]
@@ -121,21 +144,72 @@ point toward `nearby-core`.
 graph TD
     bench["nearby-bench<br/><i>binary</i>"] --> index["nearby-index"]
     bench --> core["nearby-core"]
-    server["nearby-server<br/><i>binary</i>"] --> engine["nearby-engine<br/><i>planned</i>"]
+    server["nearby-server<br/><i>binary</i>"] --> engine["nearby-engine"]
     server --> core
     index --> core
-    engine -.-> index
-    engine -.-> storage["nearby-storage<br/><i>planned</i>"]
+    engine --> index
+    engine --> storage["nearby-storage"]
+    engine --> core
+    storage --> core
 ```
 
 | Crate | Responsibility |
 |---|---|
 | `nearby-core` | Shared types (`PointId`, `Metric`, `ScoredPoint`), the error type, distance kernels and the `TopK` collector. |
 | `nearby-index` | The `VectorIndex` trait, `FlatIndex`, `Hnsw` and `PqIndex` (product quantization). |
-| `nearby-engine` | *Planned.* Collections, the id map and query execution. |
-| `nearby-storage` | *Planned.* Segments, the write-ahead log and recovery. |
-| `nearby-server` | Configuration and logging. The network API is not implemented yet. |
+| `nearby-engine` | Collections, the id map, deletes and query execution, on top of indexes and storage. |
+| `nearby-storage` | The write-ahead log, segments, compaction and recovery. |
+| `nearby-server` | The HTTP + JSON API, configuration and logging. |
 | `nearby-bench` | Recall, throughput and latency benchmark on TEXMEX datasets. |
+
+<details>
+<summary><b>Storage: <code>nearby-storage</code></b></summary>
+
+Each collection lives in its own directory, managed by a `CollectionStore`:
+
+```text
+data/collections/docs/
+├── collection.toml   dimension, metric and index settings
+├── MANIFEST          which log and segments are live
+├── wal-000007.log    writes since the last flush
+├── seg-000004.seg    immutable batches of net changes, oldest first
+└── seg-000006.seg
+```
+
+- **Write-ahead log.** Every write is appended as a CRC-32 checksummed record
+  and, with `durability = "sync"`, synced before it is acknowledged. A batch
+  upsert is one record batch and one sync.
+- **Segments.** Once the log holds `flush_after_ops` writes, its net changes
+  (the last write per id wins) become an immutable segment and a new log
+  starts. When there are more than `max_segments`, they are compacted into
+  one segment of live points.
+- **Atomic switches.** New files are fully written and synced before a new
+  `MANIFEST` is atomically renamed into place, so a crash at any moment
+  leaves either the old set of files or the new one. Leftovers are deleted
+  on the next open.
+- **Recovery** replays the segments oldest first, then the log. A record cut
+  short by a crash fails its length or checksum check and is truncated away;
+  everything acknowledged before it is kept.
+
+</details>
+
+<details>
+<summary><b>Collections: <code>nearby-engine</code></b></summary>
+
+A `Database` holds named collections, each with a fixed dimension, metric and
+index (`flat` or `hnsw`, with its parameters).
+
+- **Ids** are chosen by the caller. Writing an existing id replaces the point.
+- **Deletes and replacements.** Indexes only append, so an old vector stays
+  in the index, marked dead, and searches skip it with
+  `VectorIndex::search_filtered`. HNSW still walks through dead nodes to
+  reach live ones, so recall holds. Once dead vectors outnumber live ones,
+  the index is rebuilt without them.
+- **Restarts** replay storage and rebuild each index (in parallel for HNSW).
+- **Concurrency.** Each collection has its own read-write lock: searches run
+  alongside each other, and writes to one collection don't block others.
+
+</details>
 
 <details>
 <summary><b>Design rules</b></summary>
@@ -380,13 +454,50 @@ cargo run -p nearby-server -- [path/to/nearby.toml]
 
 The config path defaults to `nearby.toml`. A missing file means all defaults;
 unknown keys are rejected, and an invalid `RUST_LOG` stops startup with an
-error rather than being ignored.
+error rather than being ignored. Ctrl-C (or SIGTERM on Unix) stops accepting
+requests and flushes every collection before exiting.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/health` | | `{"status": "ok"}` |
+| `GET` | `/collections` | | `{"collections": ["docs"]}` |
+| `PUT` | `/collections/{name}` | `{"dim": 128, "metric": "cosine", "index": {"type": "hnsw", "m": 16}}` | `201` and collection info |
+| `GET` | `/collections/{name}` | | collection info: config, point count, segments |
+| `DELETE` | `/collections/{name}` | | `204` |
+| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...]}]}` | `{"upserted": 1}` |
+| `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": 2}` |
+| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
+| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.12}]}` |
+
+- **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
+  `index` is `{"type": "flat"}` or `{"type": "hnsw"}`, optionally with `m`,
+  `ef_construction` and `ef_search`. Names are 1 to 64 ASCII letters,
+  digits, `-` or `_`.
+- **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
+  for a missing collection or point, `409` for a name that's taken, `413`
+  for a body over `max_body_bytes`, `422` for JSON of the wrong shape.
+- `k` defaults to 10 and is at most 10,000. Ties come back in write order.
+
+> [!WARNING]
+> The API has no authentication. It listens on `127.0.0.1` by default; put it
+> behind a proxy that authenticates before exposing it on a network.
 
 <details>
 <summary><b>Every configuration key and its default</b></summary>
 
 ```toml
 data_dir = "./data"
+
+[server]
+listen = "127.0.0.1:7700"
+max_body_bytes = 67108864 # 64 MiB
+
+[engine]
+durability = "sync"       # "sync": every write is on disk before it's acknowledged
+                          # "nosync": leave syncing to the OS (survives a crash, not power loss)
+threads = 0               # threads that build indexes; 0 uses every core
+flush_after_ops = 50000   # log writes before they are flushed into a segment
+max_segments = 8          # segments kept before they are compacted into one
 
 [log]
 level = "info"            # tracing filter directive; RUST_LOG overrides it
@@ -430,9 +541,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] Benchmark harness with recall, latency percentiles and `ef` sweeps
 - [x] Parallel HNSW construction
 - [x] Product quantization
-- [ ] Engine: collections, id map, deduplication and deletes
-- [ ] Storage: segments, write-ahead log and recovery
-- [ ] Server network API
+- [x] Engine: collections, id map, deduplication and deletes
+- [x] Storage: segments, write-ahead log and recovery
+- [x] Server network API
+
+Possible next steps: persisting HNSW graphs so restarts skip the rebuild,
+PQ as a collection index (with exact re-ranking from storage), metadata
+filters on search, and authentication for the API.
 
 ## License
 
