@@ -331,7 +331,7 @@ impl Collection {
         Ok(())
     }
 
-    /// Flushes the log and, for an HNSW collection, saves a snapshot of the
+    /// Flushes the log and, for HNSW and PQ collections, saves a snapshot of the
     /// index, so the next open loads it instead of rebuilding. Called on
     /// shutdown.
     ///
@@ -756,6 +756,39 @@ mod tests {
     #[test]
     fn ivf_pq_collections_rerank_with_exact_distances() {
         check_pq_collection(16, 4);
+    }
+
+    #[test]
+    fn pq_collections_restart_from_a_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 4,
+            training_points: 500,
+            rerank: 10,
+            lists: 16,
+            probe: 4,
+        });
+        let config = CollectionConfig {
+            dim: 8,
+            ..config(pq)
+        };
+        let mut c = Collection::create(dir.path(), "c", config, options()).unwrap();
+        let points = pq_points();
+        let batch: Vec<(PointId, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+        c.upsert(&batch).unwrap();
+        c.checkpoint().unwrap();
+        // Then a crash: this reaches only the log.
+        c.upsert(&[(5_000, &[1.0; 8])]).unwrap();
+        let query = &points[3].1;
+        let expected = c.search(query, 5).unwrap();
+        drop(c);
+
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert!(c.snapshot_generation.is_some(), "loaded from the snapshot");
+        assert!(c.index.rerank().is_some(), "still trained");
+        assert_eq!(c.search(query, 5).unwrap(), expected);
+        assert_eq!(c.get(5_000), Some(&[1.0; 8][..]));
+        assert_eq!(spill_files(dir.path()).len(), 1);
     }
 
     /// Writes, searches, replaces, deletes and reopens a PQ collection
