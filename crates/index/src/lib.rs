@@ -4,20 +4,21 @@
 //!   so it is the ground truth the approximate indexes are measured against.
 //! - [`Hnsw`]: approximate search over a layered proximity graph. Much
 //!   faster on large data; recall is tuned with [`HnswParams`].
-//!
-//! Product quantization is planned and will implement the same
-//! [`VectorIndex`] trait.
+//! - [`PqIndex`]: approximate search over vectors compressed by a
+//!   [`ProductQuantizer`]. Far less memory per vector, lower recall.
 
 use nearby_core::{Result, ScoredPoint};
 
 mod flat;
 mod hnsw;
 mod parallel;
+mod pq;
 mod rng;
 mod store;
 
 pub use flat::FlatIndex;
 pub use hnsw::{Hnsw, HnswParams};
+pub use pq::{PqIndex, PqParams, ProductQuantizer};
 
 /// What every index can do once it's built.
 ///

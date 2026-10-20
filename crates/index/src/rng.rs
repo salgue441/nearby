@@ -26,6 +26,15 @@ impl SplitMix64 {
         z ^ (z >> 31)
     }
 
+    /// Uniform in `0..n`. `n` must be at least 1.
+    ///
+    /// Uses the high bits of a 64 x 64-bit product (Lemire's method), which
+    /// is unbiased enough for any `n` far below 2^64.
+    pub(crate) fn next_below(&mut self, n: usize) -> usize {
+        debug_assert!(n > 0, "the range must not be empty");
+        ((u128::from(self.next_u64()) * n as u128) >> 64) as usize
+    }
+
     /// Uniform in `(0, 1]`. Never 0, so `ln()` of it is always finite.
     pub(crate) fn next_f64(&mut self) -> f64 {
         ((self.next_u64() >> 11) + 1) as f64 / (1u64 << 53) as f64
@@ -52,6 +61,17 @@ mod tests {
             let x = rng.next_f64();
             assert!(x > 0.0 && x <= 1.0, "{x}");
         }
+    }
+
+    #[test]
+    fn bounded_draws_stay_in_range_and_cover_it() {
+        let mut rng = SplitMix64::new(3);
+        let mut seen = [false; 7];
+        for _ in 0..1_000 {
+            seen[rng.next_below(7)] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every value in 0..7 is drawn");
+        assert_eq!(rng.next_below(1), 0);
     }
 
     #[test]
