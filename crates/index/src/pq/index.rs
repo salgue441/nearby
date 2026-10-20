@@ -1,11 +1,13 @@
 //! A searchable collection of product-quantized vectors.
 
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 
 use nearby_core::{PointId, Result, ScoredPoint, TopK, validate_vector};
 
 use super::ProductQuantizer;
 use crate::VectorIndex;
+use crate::codec::{Decoder, Encoder};
 use crate::parallel::parallel_map;
 
 /// Vectors encoded per parallel task in [`PqIndex::add_batch`].
@@ -74,6 +76,11 @@ impl PqIndex {
         &self.quantizer
     }
 
+    /// Every id, in insertion order.
+    pub fn ids(&self) -> impl Iterator<Item = PointId> + '_ {
+        self.ids.iter().copied()
+    }
+
     /// Bytes of codes stored per vector, ids not included.
     pub fn bytes_per_vector(&self) -> usize {
         self.quantizer.code_len()
@@ -124,7 +131,56 @@ impl PqIndex {
         }
         codes
     }
+
+    /// Writes the index to `w`, so [`PqIndex::read_from`] can restore it
+    /// without retraining:
+    ///
+    /// ```text
+    /// magic "NBPQIX01", quantizer (see ProductQuantizer), count u64,
+    /// ids u64 × count, codes u8 × count × code_len, crc32 u32
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// If writing fails.
+    pub fn write_to(&self, w: impl Write) -> Result<()> {
+        let mut e = Encoder::new(w);
+        e.bytes(&MAGIC)?;
+        self.quantizer.write_section(&mut e)?;
+        e.u64(self.ids.len() as u64)?;
+        e.u64s(&self.ids)?;
+        e.bytes(&self.codes)?;
+        e.finish()
+    }
+
+    /// Restores an index written by [`PqIndex::write_to`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] if the data is truncated, fails its checksum or
+    /// is inconsistent; an I/O error if reading fails.
+    ///
+    /// [`Error::Corruption`]: nearby_core::Error::Corruption
+    pub fn read_from(r: impl Read) -> Result<Self> {
+        let mut d = Decoder::new(r, "PQ index");
+        d.magic(MAGIC)?;
+        let quantizer = ProductQuantizer::read_section(&mut d)?;
+        let count = usize::try_from(d.u64()?).map_err(|_| d.corrupt("count too large"))?;
+        let ids = d.u64s(count)?;
+        let size = count
+            .checked_mul(quantizer.code_len())
+            .ok_or_else(|| d.corrupt("size overflow"))?;
+        let codes = d.bytes(size)?;
+        d.finish()?;
+        Ok(Self {
+            quantizer,
+            codes,
+            ids,
+        })
+    }
 }
+
+const MAGIC: [u8; 8] = *b"NBPQIX01";
 
 impl VectorIndex for PqIndex {
     fn dim(&self) -> usize {
@@ -271,5 +327,38 @@ mod tests {
         assert!(empty.is_empty());
         let full = index(Metric::L2, &data, 1);
         assert_eq!(full.search(&data[..DIM], 0).unwrap(), Vec::new());
+    }
+
+    fn bytes(index: &PqIndex) -> Vec<u8> {
+        let mut out = Vec::new();
+        index.write_to(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn round_trips_exactly() {
+        let data = random(700, 9);
+        for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+            let original = index(metric, &data, 2);
+            let restored = PqIndex::read_from(bytes(&original).as_slice()).unwrap();
+            assert_eq!(bytes(&restored), bytes(&original), "{metric:?}");
+            assert_eq!(restored.ids().collect::<Vec<_>>(), original.ids);
+            let query = &data[..DIM];
+            assert_eq!(
+                restored.search(query, 10).unwrap(),
+                original.search(query, 10).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn damage_is_detected() {
+        let good = bytes(&index(Metric::L2, &random(300, 10), 1));
+        let mut flipped = good.clone();
+        flipped[good.len() / 2] ^= 0x10;
+        for data in [&good[..good.len() - 1], &good[..20], &flipped[..]] {
+            let err = PqIndex::read_from(data).unwrap_err();
+            assert!(matches!(err, Error::Corruption { .. }), "{err}");
+        }
     }
 }

@@ -10,8 +10,11 @@ use serde::Serialize;
 use crate::EngineOptions;
 use crate::backend::{IndexBackend, new_index};
 use crate::config::CollectionConfig;
+use crate::filter::Filter;
+use crate::payload::{self, Payload};
 use crate::points::PointTable;
 use crate::snapshot;
+use crate::vectors::VectorFile;
 
 /// The config's file name inside a collection directory.
 const CONFIG_FILE: &str = "collection.toml";
@@ -64,18 +67,15 @@ impl Collection {
         config: CollectionConfig,
         options: EngineOptions,
     ) -> Result<Self> {
-        if config.dim == 0 {
-            return Err(Error::InvalidParameter(
-                "dimension must be at least 1".to_owned(),
-            ));
-        }
-        let index = new_index(&config, 0)?;
+        config.validate()?;
         fs::create_dir_all(dir)?;
+        VectorFile::remove_leftovers(dir)?;
+        let index = new_index(&config, 0, dir)?;
         config.write(&dir.join(CONFIG_FILE))?;
         let store = CollectionStore::create(dir, config.dim, store_options(&options))?;
         Ok(Self {
             name: name.to_owned(),
-            points: PointTable::new(config.dim),
+            points: PointTable::new(),
             config,
             options,
             store,
@@ -95,31 +95,50 @@ impl Collection {
     /// loaded instead, and only the log written since is replayed.
     pub(crate) fn open(dir: &Path, name: &str, options: EngineOptions) -> Result<Self> {
         let config = CollectionConfig::read(&dir.join(CONFIG_FILE))?;
+        VectorFile::remove_leftovers(dir)?;
         let generation = CollectionStore::read_generation(dir)?;
         if let Some((points, index)) = snapshot::load(dir, &config, generation) {
             return Self::open_from_snapshot(dir, name, config, options, points, index);
         }
-        let mut points = PointTable::new(config.dim);
+        let mut points = PointTable::new();
+        // Every vector replayed, by slot, until the index holds the live ones.
+        let mut replayed: Vec<f32> = Vec::new();
+        let mut bad_payload = None;
         let store = CollectionStore::open(dir, store_options(&options), |op| match op {
-            Op::Upsert { id, vector } => {
-                points.upsert(id, vector);
+            Op::Upsert {
+                id,
+                vector,
+                payload,
+            } => {
+                let payload = payload::decode(payload).unwrap_or_else(|err| {
+                    bad_payload.get_or_insert(err);
+                    None
+                });
+                points.upsert(id, payload);
+                replayed.extend_from_slice(vector);
             }
             Op::Delete { id } => {
                 points.delete(id);
             }
         })?;
+        if let Some(err) = bad_payload {
+            return Err(err);
+        }
         check_dim(&store, &config)?;
-        let mut collection = Self {
+        let dim = config.dim;
+        let (points, index) = build_index(&config, &options, dir, &points, |slot| {
+            let start = slot as usize * dim;
+            &replayed[start..start + dim]
+        })?;
+        Ok(Self {
             name: name.to_owned(),
-            index: new_index(&config, 0)?,
             config,
             options,
             store,
             points,
+            index,
             snapshot_generation: None,
-        };
-        collection.rebuild_index()?;
-        Ok(collection)
+        })
     }
 
     /// Opens a collection whose state at the current storage generation is
@@ -162,8 +181,8 @@ impl Collection {
         let mut inserted: Vec<(PointId, &[f32])> = Vec::new();
         for op in ops {
             match op {
-                Logged::Upsert(id, vector) => {
-                    let slot = self.points.upsert(*id, vector);
+                Logged::Upsert(id, vector, payload) => {
+                    let slot = self.points.upsert(*id, payload::decode(payload)?);
                     inserted.push((u64::from(slot), vector));
                 }
                 Logged::Delete(id) => {
@@ -207,11 +226,30 @@ impl Collection {
 
     /// Point `id`'s vector, if it exists.
     pub fn get(&self, id: PointId) -> Option<&[f32]> {
-        self.points.get(id)
+        self.points.slot(id).map(|slot| self.index.vector(slot))
     }
 
-    /// Inserts `points`, replacing any that already exist. If an id appears
-    /// more than once, its last vector wins.
+    /// Point `id`'s payload, if it exists and has one.
+    pub fn payload(&self, id: PointId) -> Option<&Payload> {
+        self.points.payload(id)
+    }
+
+    /// Inserts `points` without payloads, replacing any that already exist.
+    /// The same as [`Collection::upsert_with_payloads`] with every payload
+    /// `None`.
+    ///
+    /// # Errors
+    ///
+    /// See [`Collection::upsert_with_payloads`].
+    pub fn upsert(&mut self, points: &[(PointId, &[f32])]) -> Result<()> {
+        let points: Vec<(PointId, &[f32], Option<&Payload>)> =
+            points.iter().map(|&(id, v)| (id, v, None)).collect();
+        self.upsert_with_payloads(&points)
+    }
+
+    /// Inserts `points`, each with an optional payload, replacing any that
+    /// already exist, payload included. If an id appears more than once, its
+    /// last entry wins.
     ///
     /// The batch is one durable write: with [`Durability::Sync`] it is on
     /// disk when this returns.
@@ -219,21 +257,35 @@ impl Collection {
     /// # Errors
     ///
     /// [`Error::DimensionMismatch`] or [`Error::InvalidVector`] for the first
-    /// bad vector, in which case nothing is written; or an I/O error.
+    /// bad vector, or [`Error::InvalidParameter`] for a payload that can't be
+    /// stored, in which case nothing is written; or an I/O error.
     ///
     /// [`Durability::Sync`]: nearby_storage::Durability::Sync
-    pub fn upsert(&mut self, points: &[(PointId, &[f32])]) -> Result<()> {
-        for &(_, vector) in points {
+    pub fn upsert_with_payloads(
+        &mut self,
+        points: &[(PointId, &[f32], Option<&Payload>)],
+    ) -> Result<()> {
+        let mut encoded = Vec::with_capacity(points.len());
+        for &(_, vector, payload) in points {
             validate_vector(vector, self.config.dim)?;
+            encoded.push(payload.map(payload::encode).transpose()?);
         }
         let ops: Vec<Op<'_>> = points
             .iter()
-            .map(|&(id, vector)| Op::Upsert { id, vector })
+            .zip(&encoded)
+            .map(|(&(id, vector, _), bytes)| Op::Upsert {
+                id,
+                vector,
+                payload: bytes.as_deref().unwrap_or_default(),
+            })
             .collect();
         self.store.write(&ops)?;
         let slots: Vec<(PointId, &[f32])> = points
             .iter()
-            .map(|&(id, vector)| (u64::from(self.points.upsert(id, vector)), vector))
+            .map(|&(id, vector, payload)| {
+                let slot = self.points.upsert(id, payload.cloned());
+                (u64::from(slot), vector)
+            })
             .collect();
         self.index.insert_batch(&slots, self.options.threads)?;
         self.maintain()
@@ -249,7 +301,7 @@ impl Collection {
         let mut existing: Vec<PointId> = ids
             .iter()
             .copied()
-            .filter(|&id| self.points.get(id).is_some())
+            .filter(|&id| self.points.slot(id).is_some())
             .collect();
         existing.sort_unstable();
         existing.dedup();
@@ -275,14 +327,38 @@ impl Collection {
     /// [`Error::DimensionMismatch`] or [`Error::InvalidVector`] if `query`
     /// is not a valid vector for this collection.
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+        self.search_where(query, k, None)
+    }
+
+    /// Like [`Collection::search`], but only returns points whose payload
+    /// matches `filter`, if one is given.
+    ///
+    /// The filter is applied during the search, not to its results, so up
+    /// to `k` matching points come back even when few points match. With an
+    /// HNSW index, a filter that rejects most points makes searches slower,
+    /// since the graph walk passes through rejected points to reach others.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Collection::search`].
+    pub fn search_where(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.config.dim)?;
         let rerank = self.index.rerank();
         let candidates = rerank.map_or(k, |factor| k.saturating_mul(factor.get()));
-        let live = |slot: PointId| self.points.live_id(slot as u32).is_some();
-        let mut hits = if self.points.dead() == 0 {
+        let keep = |slot: PointId| {
+            self.points
+                .live_id(slot as u32)
+                .is_some_and(|id| filter.is_none_or(|f| f.matches(self.points.payload(id))))
+        };
+        let mut hits = if self.points.dead() == 0 && filter.is_none() {
             self.index.search(query, candidates)?
         } else {
-            self.index.search_filtered(query, candidates, &live)?
+            self.index.search_filtered(query, candidates, &keep)?
         };
         if rerank.is_some() {
             hits = self.rerank(query, k, &hits);
@@ -302,7 +378,7 @@ impl Collection {
     fn rerank(&self, query: &[f32], k: usize, candidates: &[ScoredPoint]) -> Vec<ScoredPoint> {
         let mut top = TopK::new(k);
         for hit in candidates {
-            let vector = self.points.vector(hit.id as u32);
+            let vector = self.index.vector(hit.id as u32);
             top.push(hit.id, self.config.metric.distance(query, vector));
         }
         top.into_sorted()
@@ -326,7 +402,7 @@ impl Collection {
         Ok(())
     }
 
-    /// Flushes the log and, for an HNSW collection, saves a snapshot of the
+    /// Flushes the log and, for HNSW and PQ collections, saves a snapshot of the
     /// index, so the next open loads it instead of rebuilding. Called on
     /// shutdown.
     ///
@@ -370,30 +446,56 @@ impl Collection {
 
     /// Drops dead slots and builds a fresh index over the live points.
     fn rebuild_index(&mut self) -> Result<()> {
-        self.points = self.points.compacted();
-        let mut index = new_index(&self.config, self.points.len())?;
-        let slots: Vec<(PointId, &[f32])> = self
-            .points
-            .live_slots()
-            .map(|(slot, vector)| (u64::from(slot), vector))
-            .collect();
-        index.insert_batch(&slots, self.options.threads)?;
+        let (points, index) = build_index(
+            &self.config,
+            &self.options,
+            self.store.dir(),
+            &self.points,
+            |slot| self.index.vector(slot),
+        )?;
+        self.points = points;
         self.index = index;
         Ok(())
     }
 }
 
+/// A compacted copy of `points` and a fresh index over its live points,
+/// reading each one's vector from `vector`.
+fn build_index<'v>(
+    config: &CollectionConfig,
+    options: &EngineOptions,
+    dir: &Path,
+    points: &PointTable,
+    vector: impl Fn(u32) -> &'v [f32],
+) -> Result<(PointTable, Box<dyn IndexBackend>)> {
+    let compacted = points.compacted();
+    let mut index = new_index(config, compacted.len(), dir)?;
+    // Slot `s` in the compacted table is the `s`-th live slot here.
+    let batch: Vec<(PointId, &[f32])> = points
+        .live_slots()
+        .enumerate()
+        .map(|(new_slot, slot)| (new_slot as PointId, vector(slot)))
+        .collect();
+    index.insert_batch(&batch, options.threads)?;
+    Ok((compacted, index))
+}
+
 /// An op replayed from the log, owned so it outlives the replay callback.
 #[derive(Debug)]
 enum Logged {
-    Upsert(PointId, Vec<f32>),
+    /// The id, vector and encoded payload.
+    Upsert(PointId, Vec<f32>, Vec<u8>),
     Delete(PointId),
 }
 
 impl From<Op<'_>> for Logged {
     fn from(op: Op<'_>) -> Self {
         match op {
-            Op::Upsert { id, vector } => Self::Upsert(id, vector.to_vec()),
+            Op::Upsert {
+                id,
+                vector,
+                payload,
+            } => Self::Upsert(id, vector.to_vec(), payload.to_vec()),
             Op::Delete { id } => Self::Delete(id),
         }
     }
@@ -427,6 +529,8 @@ mod tests {
 
     use super::*;
     use crate::config::{HnswConfig, IndexConfig, PqConfig};
+    use crate::filter::Range;
+    use crate::payload::Value;
 
     fn options() -> EngineOptions {
         EngineOptions {
@@ -457,6 +561,8 @@ mod tests {
                 subspaces: 2,
                 training_points: 256,
                 rerank: 2,
+                lists: 0,
+                probe: 1,
             }),
         ]
     }
@@ -482,6 +588,107 @@ mod tests {
             assert_eq!(ids(&c.search(&[0.0, 0.0], 5).unwrap()), vec![3, 2]);
             assert_eq!(c.len(), 2);
         }
+    }
+
+    fn tags(lang: &str, year: f64) -> Payload {
+        Payload::from([
+            ("lang".to_owned(), Value::String(lang.to_owned())),
+            ("year".to_owned(), Value::Number(year)),
+        ])
+    }
+
+    #[test]
+    fn payloads_are_stored_filtered_and_recovered() {
+        let lang = |l: &str| Filter::Eq {
+            field: "lang".to_owned(),
+            value: Value::String(l.to_owned()),
+        };
+        let recent = Filter::Range {
+            field: "year".to_owned(),
+            range: Range {
+                gte: Some(2021.0),
+                ..Range::default()
+            },
+        };
+        let untagged = Filter::Not(Box::new(Filter::Exists("lang".to_owned())));
+        let (en, es) = (tags("en", 2020.0), tags("es", 2023.0));
+        for index in every_index() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = Collection::create(dir.path(), "c", config(index), options()).unwrap();
+            c.upsert_with_payloads(&[
+                (1, &[0.0, 0.0], Some(&en)),
+                (2, &[1.0, 0.0], Some(&es)),
+                (3, &[2.0, 0.0], None),
+            ])
+            .unwrap();
+            let search =
+                |c: &Collection, f: &Filter| ids(&c.search_where(&[0.0, 0.0], 3, Some(f)).unwrap());
+            assert_eq!(search(&c, &lang("es")), vec![2]);
+            assert_eq!(search(&c, &recent), vec![2]);
+            assert_eq!(search(&c, &untagged), vec![3]);
+
+            c.flush().unwrap(); // those three move into a segment
+            c.upsert_with_payloads(&[(4, &[3.0, 0.0], Some(&es))])
+                .unwrap();
+            c.upsert(&[(2, &[1.0, 0.0])]).unwrap(); // a replacement drops the payload
+            drop(c);
+
+            let mut c = Collection::open(dir.path(), "c", options()).unwrap();
+            assert_eq!(c.payload(1), Some(&en));
+            assert_eq!(c.payload(2), None);
+            assert_eq!(c.payload(4), Some(&es));
+            assert_eq!(search(&c, &lang("es")), vec![4]);
+            assert_eq!(search(&c, &untagged), vec![2, 3]);
+
+            c.checkpoint().unwrap();
+            drop(c);
+            let c = Collection::open(dir.path(), "c", options()).unwrap();
+            assert_eq!(c.payload(4), Some(&es), "through a snapshot too");
+            assert_eq!(search(&c, &lang("es")), vec![4]);
+        }
+    }
+
+    #[test]
+    fn a_filter_still_returns_k_matching_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Collection::create(
+            dir.path(),
+            "c",
+            config(IndexConfig::Hnsw(HnswConfig::default())),
+            options(),
+        )
+        .unwrap();
+        let points: Vec<(PointId, [f32; 2], Payload)> = (0..2_000u64)
+            .map(|id| {
+                let lang = if id % 10 == 0 { "rare" } else { "common" };
+                (id, [id as f32, 0.0], tags(lang, 2000.0))
+            })
+            .collect();
+        let batch: Vec<(PointId, &[f32], Option<&Payload>)> = points
+            .iter()
+            .map(|(id, v, p)| (*id, &v[..], Some(p)))
+            .collect();
+        c.upsert_with_payloads(&batch).unwrap();
+        let rare = Filter::Eq {
+            field: "lang".to_owned(),
+            value: Value::String("rare".to_owned()),
+        };
+        let hits = c.search_where(&[1_000.0, 0.0], 5, Some(&rare)).unwrap();
+        assert_eq!(ids(&hits), vec![1_000, 990, 1_010, 980, 1_020]);
+    }
+
+    #[test]
+    fn unstorable_payloads_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c =
+            Collection::create(dir.path(), "c", config(IndexConfig::Flat), options()).unwrap();
+        let bad = Payload::from([("x".to_owned(), Value::Number(f64::INFINITY))]);
+        assert!(matches!(
+            c.upsert_with_payloads(&[(1, &[0.0, 0.0], None), (2, &[1.0, 1.0], Some(&bad))]),
+            Err(Error::InvalidParameter(_))
+        ));
+        assert!(c.is_empty());
+        assert_eq!(c.info().wal_ops, 0);
     }
 
     #[test]
@@ -546,6 +753,45 @@ mod tests {
             Collection::open(dir.path(), "c", options).unwrap().len(),
             100
         );
+    }
+
+    /// Names of the vector spill files in `dir`.
+    fn spill_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("vectors-"))
+            .collect()
+    }
+
+    #[test]
+    fn pq_collections_keep_one_spill_file_through_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 2,
+            training_points: 256,
+            rerank: 2,
+            lists: 0,
+            probe: 1,
+        });
+        let mut c = Collection::create(dir.path(), "c", config(pq), options()).unwrap();
+        let points: Vec<(PointId, [f32; 2])> =
+            (0..3_000u64).map(|id| (id, [id as f32, 1.0])).collect();
+        let batch: Vec<(PointId, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+        c.upsert(&batch).unwrap();
+        let before = spill_files(dir.path());
+        assert_eq!(before.len(), 1);
+
+        let doomed: Vec<PointId> = (0..2_000).collect();
+        c.delete(&doomed).unwrap();
+        assert_eq!(c.points.dead(), 0, "rebuilt");
+        let after = spill_files(dir.path());
+        assert_eq!(after.len(), 1, "the old file went with the old index");
+        assert_ne!(after, before);
+        assert_eq!(c.get(2_500), Some(&[2_500.0, 1.0][..]));
+
+        drop(c);
+        assert_eq!(spill_files(dir.path()), Vec::<String>::new());
     }
 
     #[test]
@@ -683,11 +929,57 @@ mod tests {
 
     #[test]
     fn pq_collections_rerank_with_exact_distances() {
+        check_pq_collection(0, 1);
+    }
+
+    #[test]
+    fn ivf_pq_collections_rerank_with_exact_distances() {
+        check_pq_collection(16, 4);
+    }
+
+    #[test]
+    fn pq_collections_restart_from_a_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let pq = IndexConfig::Pq(PqConfig {
             subspaces: 4,
             training_points: 500,
             rerank: 10,
+            lists: 16,
+            probe: 4,
+        });
+        let config = CollectionConfig {
+            dim: 8,
+            ..config(pq)
+        };
+        let mut c = Collection::create(dir.path(), "c", config, options()).unwrap();
+        let points = pq_points();
+        let batch: Vec<(PointId, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+        c.upsert(&batch).unwrap();
+        c.checkpoint().unwrap();
+        // Then a crash: this reaches only the log.
+        c.upsert(&[(5_000, &[1.0; 8])]).unwrap();
+        let query = &points[3].1;
+        let expected = c.search(query, 5).unwrap();
+        drop(c);
+
+        let c = Collection::open(dir.path(), "c", options()).unwrap();
+        assert!(c.snapshot_generation.is_some(), "loaded from the snapshot");
+        assert!(c.index.rerank().is_some(), "still trained");
+        assert_eq!(c.search(query, 5).unwrap(), expected);
+        assert_eq!(c.get(5_000), Some(&[1.0; 8][..]));
+        assert_eq!(spill_files(dir.path()).len(), 1);
+    }
+
+    /// Writes, searches, replaces, deletes and reopens a PQ collection
+    /// with the given clustering.
+    fn check_pq_collection(lists: usize, probe: usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 4,
+            training_points: 500,
+            rerank: 10,
+            lists,
+            probe,
         });
         let config = CollectionConfig {
             dim: 8,

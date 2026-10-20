@@ -53,15 +53,31 @@ Run the server (it stores data in `./data` and listens on `127.0.0.1:7700`):
 cargo run -p nearby-server --release
 ```
 
+Or with Docker, keeping the data in a volume (the image listens on every
+interface, so set an API key; `curl` then needs `-H 'Authorization: Bearer
+change-me'`):
+
+```sh
+docker build -t nearby .
+docker run -p 7700:7700 -v nearby-data:/data -e NEARBY_API_KEY=change-me nearby
+```
+
+The image's config is [`docker/nearby.toml`](docker/nearby.toml); mount
+another file over `/etc/nearby/nearby.toml` to change it. Logs go to stdout
+as JSON lines.
+
 Then create a collection, add points and search:
 
 ```sh
-curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \n  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
+curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \
+  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
 
-curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \n  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
+curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \
+  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
                   {"id": 3, "vector": [0.9, 0.1, 0]}]}'
 
-curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \n  -d '{"vector": [1, 0.05, 0], "k": 2}'
+curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \
+  -d '{"vector": [1, 0.05, 0], "k": 2}'
 # {"results":[{"id":1,"distance":0.0012476444},{"id":3,"distance":0.0018416047}]}
 ```
 
@@ -170,7 +186,8 @@ Each collection lives in its own directory, managed by a `CollectionStore`:
 ```text
 data/collections/docs/
 ├── collection.toml   dimension, metric and index settings
-├── index.snapshot    HNSW graph and id map, saved on shutdown (a cache)
+├── index.snapshot    HNSW or PQ index and id map, saved on shutdown (a cache)
+├── vectors-*.spill   a PQ collection's full vectors, memory-mapped (scratch)
 ├── MANIFEST          which log and segments are live
 ├── wal-000007.log    writes since the last flush
 ├── seg-000004.seg    immutable batches of net changes, oldest first
@@ -183,7 +200,10 @@ data/collections/docs/
 - **Segments.** Once the log holds `flush_after_ops` writes, its net changes
   (the last write per id wins) become an immutable segment and a new log
   starts. When there are more than `max_segments`, they are compacted into
-  one segment of live points.
+  one segment of live points. Compaction streams a k-way merge through the
+  segments in id order, so its memory doesn't grow with the collection: 15 MB
+  to compact 1M 128-d points (it was 1.1 GB when segments were loaded whole).
+  Segments with payloads use format version 2; version 1 files still load.
 - **Atomic switches.** New files are fully written and synced before a new
   `MANIFEST` is atomically renamed into place, so a crash at any moment
   leaves either the old set of files or the new one. Leftovers are deleted
@@ -206,18 +226,24 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   `VectorIndex::search_filtered`. HNSW still walks through dead nodes to
   reach live ones, so recall holds. Once dead vectors outnumber live ones,
   the index is rebuilt without them.
-- **Restarts.** On shutdown, each HNSW collection saves a snapshot of its
-  graph and id map, tagged with the storage generation it matches. On start,
+- **Restarts.** On shutdown, each HNSW and PQ collection saves a snapshot of
+  its index and id map, tagged with the storage generation it matches. On start,
   a matching snapshot is loaded and only the log written since is replayed;
   otherwise (a crash after a flush, a damaged file) the index is rebuilt
   from storage. On SIFT1M, a restart takes 1.8 s instead of 87 s (the
-  snapshot is 591 MB and takes 1.7 s to write).
+  snapshot is 591 MB and takes 1.7 s to write). A PQ collection's snapshot
+  holds its quantizer, codes and full vectors: 2.6 s instead of 8.5 s to
+  retrain (545 MB, 3.1 s to write). Flat collections rebuild faster than a
+  snapshot would load, so they don't save one.
 - **PQ collections.** A quantizer needs data to train on, so a `pq`
   collection searches exactly until `training_points` points (default
   10,000) have been written, then trains on them and encodes every point.
-  Each search then scans the codes for `rerank * k` candidates (default
-  `rerank = 10`) and returns the best `k` by exact distance, using the
-  full vectors the engine keeps anyway. On SIFT1M with 16 subspaces:
+  The codes are grouped into `lists` clusters (default 256; 0 turns this
+  off), and each search scans the `probe` clusters nearest the query
+  (default 16) for `rerank * k` candidates (default `rerank = 10`), then
+  returns the best `k` by exact distance, reading the candidates' full
+  vectors from a memory-mapped scratch file. On SIFT1M with 16 subspaces,
+  scanning every code (`lists = 0`):
 
   | `rerank` | recall@10 |
   |---|---|
@@ -227,11 +253,38 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   | 20 | 0.9906 |
   | 50 | 0.9984 |
 
-  Searches take about 10 ms either way, since scanning a million codes
-  dominates. Loading the million points takes 15 s (HNSW: 90 s), and a PQ
-  collection isn't snapshotted: each start retrains, which takes 6 s here.
-  HNSW searches are much faster, so PQ is for when build time or index
-  memory matters more than latency.
+  Those searches take about 10 ms whatever `rerank` is, since scanning a
+  million codes dominates. Clusters cut that down (`rerank = 10`):
+
+  | `lists` / `probe` | recall@10 | Mean latency |
+  |---|---|---|
+  | 0 (scan every code) | 0.9654 | 9.7 ms |
+  | 256 / 8 | 0.9036 | 0.49 ms |
+  | **256 / 16 (default)** | **0.9500** | **0.80 ms** |
+  | 256 / 32 | 0.9636 | 1.43 ms |
+  | 1024 / 64, 50,000 training points | 0.9673 | 0.82 ms |
+
+  Loading the million points takes 18 s (HNSW: 90 s). HNSW still searches
+  faster at higher recall; PQ is for when build time or memory matters more.
+- **Memory.** Each vector is held once: by the index for flat and HNSW
+  collections, and for PQ in the scratch file, which the OS caches as
+  memory allows, so only the 16-byte codes stay in the process. With SIFT1M
+  loaded, the server process holds 856 MB for HNSW (was 1,370 MB, before
+  vectors stopped being kept twice) and 80 MB for PQ (was 591 MB).
+- **Payloads and filters.** A point's payload lives in the id map and is
+  stored with its vector in the log, segments and snapshots. A filter is
+  checked as each candidate is reached, so the index keeps searching until
+  it finds `k` matches. HNSW walks through rejected points to reach matching
+  ones: recall stays high, but the more a filter rejects, the more of the
+  graph a search visits. SIFT1M, HNSW defaults, 200 queries:
+
+  | Filter keeps | recall@10 | Mean latency |
+  |---|---|---|
+  | every point (no filter) | 0.9700 | 0.31 ms |
+  | 10% | 0.9985 | 4.4 ms |
+  | 1% | 1.0000 | 33.7 ms |
+
+  At 1% a search costs about as much as an exact scan.
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 
@@ -323,7 +376,7 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 </details>
 
 <details>
-<summary><b>Compressed search: <code>PqIndex</code></b></summary>
+<summary><b>Compressed search: <code>PqIndex</code> and <code>IvfPqIndex</code></b></summary>
 
 `PqIndex` implements product quantization (Jégou, Douze & Schmid, 2011).
 Each vector is split into `subspaces` equal slices, and each slice is replaced
@@ -345,8 +398,14 @@ index.add_batch(&points, threads)?;
   costs one lookup per subspace, summed into four independent accumulators.
 - **Metrics.** L2 and dot product are approximated directly; cosine works on
   normalized vectors.
-- Only codes and ids are stored, so results can't be re-ranked with exact
-  distances yet.
+- Only codes and ids are stored. Collections re-rank candidates with exact
+  distances (see the engine section).
+- **IVF-PQ.** `IvfPqIndex` also groups the codes by their nearest of
+  `lists` coarse centroids (k-means on the training vectors), and a search
+  scans only the `probe` lists nearest the query. Codes encode the vectors
+  themselves, not their offsets from the centroid, so one distance table
+  serves every list; probing every list returns exactly what `PqIndex`
+  does.
 
 SIFT1M, 100k training vectors, 10k queries, 16 threads:
 
@@ -355,12 +414,17 @@ SIFT1M, 100k training vectors, 10k queries, 16 threads:
 | `FlatIndex` | 512 | 0.9994 | 30.4 ms | – |
 | `PqIndex`, 16 subspaces | 16 | 0.5452 | 7.4 ms | 7.7 s + 6.2 s |
 | `PqIndex`, 32 subspaces | 32 | 0.7215 | 14.4 ms | 9.9 s + 8.8 s |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 8 | 16 | 0.5074 | 0.11 ms | 17.5 s + 9.0 s |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 16 | 16 | 0.5327 | 0.18 ms | |
+| `IvfPqIndex`, 16 subspaces, 1024 lists, probe 64 | 16 | 0.5448 | 0.62 ms | |
 
 | Parameter | Default | Effect |
 |---|---|---|
 | `subspaces` | 16 | Code bytes per vector; must divide the dimension. More: better recall, more memory, slower searches. |
 | `iterations` | 25 | Maximum k-means iterations per subspace. |
 | `seed` | `0x5EED` | Seed for k-means++ seeding. |
+| `lists` (IVF-PQ) | 256 | Coarse clusters. Around `sqrt(n)` for `n` vectors; each needs a few dozen training vectors. |
+| `probe` (IVF-PQ) | 16 | Clusters a search scans. More: higher recall, slower searches. `set_probe` changes it without retraining. |
 
 </details>
 
@@ -423,13 +487,15 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | Option | Default | Meaning |
 |---|---|---|
 | `DATASET_DIR` | `data/siftsmall` | Dataset directory. |
-| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. |
+| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, `ivfpq`, or `both` (flat and hnsw) or `all`. |
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
 | `--pq-subspaces N` | `16` | PQ code bytes per vector. Must divide the dimension. |
 | `--pq-train N` | `100000` | Base vectors, from the front of the file, that PQ is trained on. |
-| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ. Results are the same for any value. |
+| `--ivf-lists N` | `1024` | IVF-PQ clusters. |
+| `--probe N,N,...` | `1,2,4,8,16,32,64` | IVF-PQ clusters each search scans; one result row per value. |
+| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ and IVF-PQ. Results are the same for any value. |
 | `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, one result row each. Values below `k` run as `k`, and each row is labeled with the `ef` it actually used. |
 | `-h`, `--help` | | Print usage. |
 
@@ -490,29 +556,52 @@ requests and flushes every collection before exiting.
 | `PUT` | `/collections/{name}` | `{"dim": 128, "metric": "cosine", "index": {"type": "hnsw", "m": 16}}` | `201` and collection info |
 | `GET` | `/collections/{name}` | | collection info: config, point count, segments |
 | `DELETE` | `/collections/{name}` | | `204` |
-| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...]}]}` | `{"upserted": 1}` |
+| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...], "payload": {"lang": "en"}}]}` | `{"upserted": 1}` |
 | `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": 2}` |
-| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
-| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.12}]}` |
+| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
+| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.12, "payload": {...}}]}` |
+| `POST` | `/collections/{name}/search/batch` | `{"searches": [search, ...]}`, up to 1,024 | `{"results": [[...], ...]}`, one list per search, in order |
+| `GET` | `/metrics` | | request counts and latencies by route, and each collection's points, segments and log length, in the Prometheus text format |
 
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
   `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
   `ef_construction` and `ef_search`) or `{"type": "pq"}` (optionally with
-  `subspaces`, `training_points` and `rerank`). Names are 1 to 64 ASCII letters,
-  digits, `-` or `_`.
+  `subspaces`, `training_points`, `rerank`, `lists` and `probe`). Names are
+  1 to 64 ASCII letters, digits, `-` or `_`.
+- **Payloads** are optional JSON objects of booleans, numbers and strings,
+  up to 64 KiB encoded per point. Writing a point replaces its payload too;
+  writing it without one removes it. Search results include payloads only
+  with `"with_payload": true`.
+- **Filters** limit a search to points whose payload matches, and are
+  applied during the search, so `k` matching points still come back when
+  few match:
+
+  | Filter | Matches points whose payload |
+  |---|---|
+  | `{"field": "lang", "eq": "en"}` | has `lang` equal to `"en"` |
+  | `{"field": "lang", "in": ["en", "es"]}` | has `lang` equal to any of them |
+  | `{"field": "year", "gte": 2020, "lt": 2024}` | has a number `year` within every bound given (`gt`, `gte`, `lt`, `lte`) |
+  | `{"field": "lang", "exists": true}` | has a `lang` field (`false`: hasn't) |
+  | `{"and": [...]}`, `{"or": [...]}`, `{"not": {...}}` | matches all, any, or not the given filters |
 - **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
   for a missing collection or point, `409` for a name that's taken, `413`
   for a body over `max_body_bytes`, `422` for JSON of the wrong shape.
 - `k` defaults to 10 and is at most 10,000. Ties come back in write order.
+- **Batch searches** run in parallel under one read lock and save a round
+  trip per query. An error in any search fails the batch, naming it:
+  `search 3: dimension mismatch ...`.
 
 - **Authentication.** Set `api_key` under `[server]`, or the `NEARBY_API_KEY`
   environment variable, and every endpoint but `/health` requires
   `Authorization: Bearer <key>`, answering `401` without it.
+- **HTTPS.** Set `tls_cert` and `tls_key` under `[server]` to PEM files (a
+  certificate chain and its private key) and the server speaks only HTTPS,
+  with rustls. Or leave them out and terminate TLS in a proxy in front.
 
 > [!WARNING]
 > Without an API key, every request is accepted. The server listens on
-> `127.0.0.1` by default; set a key, and terminate TLS in front of it (the
-> key travels in a header), before exposing it on a network.
+> `127.0.0.1` by default; set a key, and serve HTTPS (the key travels in a
+> header), before exposing it on a network.
 
 <details>
 <summary><b>Every configuration key and its default</b></summary>
@@ -524,6 +613,8 @@ data_dir = "./data"
 listen = "127.0.0.1:7700"
 max_body_bytes = 67108864 # 64 MiB
 # api_key = "..."        # require "Authorization: Bearer <key>"; NEARBY_API_KEY overrides it
+# tls_cert = "cert.pem"  # serve HTTPS with this PEM certificate chain...
+# tls_key = "key.pem"    # ...and this PEM private key (both or neither)
 
 [engine]
 durability = "sync"       # "sync": every write is on disk before it's acknowledged
@@ -577,10 +668,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] Engine: collections, id map, deduplication and deletes
 - [x] Storage: segments, write-ahead log and recovery
 - [x] Server network API
+- [x] IVF-PQ, PQ collections with exact re-ranking, and snapshots for HNSW and PQ
+- [x] Payloads and filtered search
+- [x] Batch search, Prometheus metrics, HTTPS and a Docker image
 
-Possible next steps: metadata filters on search, PQ snapshots (a PQ
-collection retrains on every start), and dropping the engine's full-precision
-copy of each vector for PQ collections.
+Possible next steps: a payload index, so filters that match few points stop
+walking the HNSW graph (see the filter latencies above); and replication.
 
 ## License
 

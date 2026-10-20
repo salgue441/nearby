@@ -13,8 +13,8 @@
 //!   vector stays in the index, where searches skip it; once dead vectors
 //!   outnumber live ones, the index is rebuilt without them.
 //! - **Recovery.** Opening a collection replays its storage and rebuilds the
-//!   index, in parallel where the index allows. An HNSW collection saves a
-//!   snapshot on checkpoint, so it only replays the log written since.
+//!   index, in parallel where the index allows. HNSW and PQ collections save
+//!   a snapshot on checkpoint, so they only replay the log written since.
 //! - **Indexes.** Flat (exact), HNSW, or PQ: compressed codes whose
 //!   candidates are re-ranked by exact distance (see [`PqConfig`]).
 
@@ -22,16 +22,21 @@ mod backend;
 mod collection;
 mod config;
 mod database;
+mod filter;
+mod payload;
 mod points;
 mod pq;
 mod snapshot;
+mod vectors;
 
 use std::num::NonZeroUsize;
 
 pub use collection::{Collection, CollectionInfo};
 pub use config::{CollectionConfig, HnswConfig, IndexConfig, PqConfig};
 pub use database::{CollectionHandle, Database};
+pub use filter::{Filter, Range};
 pub use nearby_storage::Durability;
+pub use payload::{MAX_PAYLOAD_BYTES, Payload, Value};
 
 /// Settings shared by every collection in a [`Database`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

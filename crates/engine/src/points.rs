@@ -4,33 +4,29 @@ use std::collections::HashMap;
 
 use nearby_core::PointId;
 
-/// Every vector a collection's index holds, by slot, plus a map from point
-/// id to the slot with its current vector.
+use crate::payload::Payload;
+
+/// Every slot a collection's index holds, a map from point id to the slot
+/// with its current vector, and each point's payload. The vectors themselves
+/// live in the index.
 ///
 /// Indexes can only append, so replacing or deleting a point never touches
 /// the index: the old slot is just marked dead, and searches skip it. Dead
 /// slots are reclaimed by building a compacted table and a fresh index.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PointTable {
-    dim: usize,
-    /// Slot `s`'s vector is `vectors[s * dim..(s + 1) * dim]`.
-    vectors: Vec<f32>,
     /// `ids[s]` is the point slot `s` was written for.
     ids: Vec<PointId>,
     live: Vec<bool>,
     /// The live slot of every point.
     slots: HashMap<PointId, u32>,
+    /// The payload of every live point that has one.
+    payloads: HashMap<PointId, Payload>,
 }
 
 impl PointTable {
-    pub(crate) fn new(dim: usize) -> Self {
-        Self {
-            dim,
-            vectors: Vec::new(),
-            ids: Vec::new(),
-            live: Vec::new(),
-            slots: HashMap::new(),
-        }
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     /// Number of live points.
@@ -48,12 +44,14 @@ impl PointTable {
         self.slot_count() - self.len()
     }
 
-    /// Stores `vector` as point `id` in a new slot, which it returns. A slot
-    /// the point had before becomes dead.
-    pub(crate) fn upsert(&mut self, id: PointId, vector: &[f32]) -> u32 {
-        debug_assert_eq!(vector.len(), self.dim, "caller validates vectors");
+    /// Gives point `id` a new slot, which it returns, and `payload`. A slot
+    /// the point had before becomes dead, and its old payload is dropped.
+    pub(crate) fn upsert(&mut self, id: PointId, payload: Option<Payload>) -> u32 {
+        match payload {
+            Some(payload) => self.payloads.insert(id, payload),
+            None => self.payloads.remove(&id),
+        };
         let slot = u32::try_from(self.ids.len()).expect("fewer than 2^32 slots");
-        self.vectors.extend_from_slice(vector);
         self.ids.push(id);
         self.live.push(true);
         if let Some(old) = self.slots.insert(id, slot) {
@@ -67,13 +65,24 @@ impl PointTable {
         let Some(slot) = self.slots.remove(&id) else {
             return false;
         };
+        self.payloads.remove(&id);
         self.live[slot as usize] = false;
         true
     }
 
-    /// Point `id`'s current vector.
-    pub(crate) fn get(&self, id: PointId) -> Option<&[f32]> {
-        self.slots.get(&id).map(|&slot| self.vector(slot))
+    /// The slot holding point `id`'s current vector.
+    pub(crate) fn slot(&self, id: PointId) -> Option<u32> {
+        self.slots.get(&id).copied()
+    }
+
+    /// Point `id`'s payload, if it is live and has one.
+    pub(crate) fn payload(&self, id: PointId) -> Option<&Payload> {
+        self.payloads.get(&id)
+    }
+
+    /// Every payload, by point id.
+    pub(crate) fn payloads(&self) -> &HashMap<PointId, Payload> {
+        &self.payloads
     }
 
     /// The point in `slot`, if the slot is live.
@@ -82,17 +91,9 @@ impl PointTable {
         (*self.live.get(s)?).then(|| self.ids[s])
     }
 
-    /// The vector in `slot`, live or dead.
-    pub(crate) fn vector(&self, slot: u32) -> &[f32] {
-        let s = slot as usize;
-        &self.vectors[s * self.dim..(s + 1) * self.dim]
-    }
-
-    /// Every live point with its slot, in slot order.
-    pub(crate) fn live_slots(&self) -> impl Iterator<Item = (u32, &[f32])> {
-        (0..self.slot_count() as u32)
-            .filter(|&slot| self.live[slot as usize])
-            .map(|slot| (slot, self.vector(slot)))
+    /// Every live slot, in order.
+    pub(crate) fn live_slots(&self) -> impl Iterator<Item = u32> {
+        (0..self.slot_count() as u32).filter(|&slot| self.live[slot as usize])
     }
 
     /// Every slot's point id and whether it is live, in slot order.
@@ -100,38 +101,34 @@ impl PointTable {
         self.ids.iter().copied().zip(self.live.iter().copied())
     }
 
-    /// Rebuilds a table from [`PointTable::slots`] and each slot's vector.
-    ///
-    /// # Panics
-    ///
-    /// If `vectors` doesn't yield one `dim`-long vector per slot.
-    pub(crate) fn from_slots<'a>(
-        dim: usize,
+    /// Rebuilds a table from [`PointTable::slots`] and
+    /// [`PointTable::payloads`]. Payloads of points that aren't live are
+    /// dropped.
+    pub(crate) fn from_slots(
         slots: &[(PointId, bool)],
-        vectors: impl Iterator<Item = &'a [f32]>,
+        mut payloads: HashMap<PointId, Payload>,
     ) -> Self {
-        let mut table = Self::new(dim);
-        for (&(id, live), vector) in slots.iter().zip(vectors) {
-            assert_eq!(vector.len(), dim, "vectors must have the table's dimension");
-            let slot = u32::try_from(table.ids.len()).expect("fewer than 2^32 slots");
-            table.vectors.extend_from_slice(vector);
-            table.ids.push(id);
-            table.live.push(live);
-            if live {
-                table.slots.insert(id, slot);
+        let mut table = Self::new();
+        for &(id, live) in slots {
+            let slot = table.upsert(id, None);
+            if !live {
+                table.live[slot as usize] = false;
+                table.slots.remove(&id);
             }
         }
-        assert_eq!(table.ids.len(), slots.len(), "one vector per slot");
+        payloads.retain(|id, _| table.slots.contains_key(id));
+        table.payloads = payloads;
         table
     }
 
     /// A table with the same live points and no dead slots. Points keep
     /// their relative order, so slot `s` here is the `s`-th live slot there.
     pub(crate) fn compacted(&self) -> Self {
-        let mut table = Self::new(self.dim);
-        for (slot, vector) in self.live_slots() {
-            table.upsert(self.ids[slot as usize], vector);
+        let mut table = Self::new();
+        for slot in self.live_slots() {
+            table.upsert(self.ids[slot as usize], None);
         }
+        table.payloads.clone_from(&self.payloads);
         table
     }
 }
@@ -142,15 +139,11 @@ mod tests {
 
     #[test]
     fn upserts_replace_and_deletes_remove() {
-        let mut t = PointTable::new(2);
-        assert_eq!(t.upsert(10, &[1.0, 1.0]), 0);
-        assert_eq!(t.upsert(20, &[2.0, 2.0]), 1);
-        assert_eq!(
-            t.upsert(10, &[3.0, 3.0]),
-            2,
-            "a replacement gets a new slot"
-        );
-        assert_eq!(t.get(10), Some(&[3.0, 3.0][..]));
+        let mut t = PointTable::new();
+        assert_eq!(t.upsert(10, None), 0);
+        assert_eq!(t.upsert(20, None), 1);
+        assert_eq!(t.upsert(10, None), 2, "a replacement gets a new slot");
+        assert_eq!(t.slot(10), Some(2));
         assert_eq!((t.len(), t.slot_count(), t.dead()), (2, 3, 1));
         assert_eq!(t.live_id(0), None, "the replaced slot is dead");
         assert_eq!(t.live_id(2), Some(10));
@@ -158,49 +151,79 @@ mod tests {
         assert!(t.delete(20));
         assert!(!t.delete(20), "already gone");
         assert!(!t.delete(99), "never existed");
-        assert_eq!(t.get(20), None);
+        assert_eq!(t.slot(20), None);
         assert_eq!((t.len(), t.dead()), (1, 2));
         assert_eq!(t.live_id(7), None, "out of range");
     }
 
     #[test]
     fn compaction_keeps_live_points_in_order() {
-        let mut t = PointTable::new(1);
+        let mut t = PointTable::new();
         for id in 0..5 {
-            t.upsert(id, &[id as f32]);
+            t.upsert(id, None);
         }
         t.delete(1);
-        t.upsert(3, &[30.0]);
+        t.upsert(3, None);
         let c = t.compacted();
         assert_eq!((c.len(), c.dead()), (4, 0));
         let ids: Vec<PointId> = (0..4).map(|s| c.live_id(s).unwrap()).collect();
         assert_eq!(ids, vec![0, 2, 4, 3]);
-        assert_eq!(c.get(3), Some(&[30.0][..]));
+        assert_eq!(c.slot(3), Some(3));
     }
 
     #[test]
     fn slots_round_trip_through_from_slots() {
-        let mut t = PointTable::new(1);
-        t.upsert(1, &[1.0]);
-        t.upsert(2, &[2.0]);
-        t.upsert(1, &[3.0]);
+        let mut t = PointTable::new();
+        t.upsert(1, None);
+        t.upsert(2, None);
+        t.upsert(1, None);
         t.delete(2);
         let slots: Vec<(PointId, bool)> = t.slots().collect();
         assert_eq!(slots, vec![(1, false), (2, false), (1, true)]);
-        let vectors = [[1.0], [2.0], [3.0]];
-        let r = PointTable::from_slots(1, &slots, vectors.iter().map(|v| &v[..]));
+        let r = PointTable::from_slots(&slots, HashMap::new());
         assert_eq!((r.len(), r.dead()), (1, 2));
-        assert_eq!(r.get(1), Some(&[3.0][..]));
+        assert_eq!(r.slot(1), Some(2));
         assert_eq!(r.live_id(2), Some(1));
     }
 
     #[test]
+    fn payloads_follow_their_point() {
+        use crate::payload::Value;
+
+        let tagged = |tag: &str| {
+            Some(Payload::from([(
+                "tag".to_owned(),
+                Value::String(tag.to_owned()),
+            )]))
+        };
+        let mut t = PointTable::new();
+        t.upsert(1, tagged("a"));
+        t.upsert(2, tagged("b"));
+        t.upsert(3, None);
+        assert_eq!(t.payload(1), tagged("a").as_ref());
+        assert_eq!(t.payload(3), None);
+
+        t.upsert(1, None);
+        assert_eq!(t.payload(1), None, "a replacement drops the old payload");
+        t.delete(2);
+        assert_eq!(t.payload(2), None);
+        t.upsert(3, tagged("c"));
+        assert_eq!(t.compacted().payload(3), tagged("c").as_ref());
+
+        let slots: Vec<(PointId, bool)> = t.slots().collect();
+        let mut payloads = t.payloads().clone();
+        payloads.insert(2, tagged("stale").unwrap());
+        let r = PointTable::from_slots(&slots, payloads);
+        assert_eq!(r.payload(3), tagged("c").as_ref());
+        assert_eq!(r.payload(2), None, "payloads of dead points are dropped");
+    }
+
+    #[test]
     fn live_slots_skip_dead_ones() {
-        let mut t = PointTable::new(1);
-        t.upsert(1, &[1.0]);
-        t.upsert(2, &[2.0]);
+        let mut t = PointTable::new();
+        t.upsert(1, None);
+        t.upsert(2, None);
         t.delete(1);
-        let live: Vec<(u32, Vec<f32>)> = t.live_slots().map(|(s, v)| (s, v.to_vec())).collect();
-        assert_eq!(live, vec![(1, vec![2.0])]);
+        assert_eq!(t.live_slots().collect::<Vec<_>>(), vec![1]);
     }
 }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use nearby_core::{Error, Result};
 
 use crate::manifest::{self, Manifest};
+use crate::merge;
 use crate::segment::{self, Changes};
 use crate::wal::{self, Durability, Op, Wal};
 
@@ -36,7 +37,7 @@ pub struct StoreOptions {
 ///
 /// let dir = tempfile::tempdir()?;
 /// let mut store = CollectionStore::create(dir.path(), 2, StoreOptions::default())?;
-/// store.write(&[Op::Upsert { id: 7, vector: &[1.0, 2.0] }])?;
+/// store.write(&[Op::Upsert { id: 7, vector: &[1.0, 2.0], payload: &[] }])?;
 /// drop(store);
 ///
 /// let mut ids = Vec::new();
@@ -240,7 +241,8 @@ impl CollectionStore {
     /// Flushes the log, then merges every segment into one that holds only
     /// the live points. Does nothing more if there is at most one segment.
     ///
-    /// This reads every point into memory while it runs.
+    /// The merge streams through the segments in id order, so its memory use
+    /// doesn't grow with the collection.
     ///
     /// # Errors
     ///
@@ -250,15 +252,15 @@ impl CollectionStore {
         if self.manifest.segments.len() <= 1 {
             return Ok(());
         }
-        let mut changes = Changes::default();
-        for name in &self.manifest.segments {
-            segment::read(&self.dir.join(name), self.dim(), |op| changes.apply(op))?;
-        }
-        changes.drop_deletes();
-
+        let inputs: Vec<PathBuf> = self
+            .manifest
+            .segments
+            .iter()
+            .map(|name| self.dir.join(name))
+            .collect();
         let mut manifest = self.manifest.clone();
         let segment = manifest.new_segment_name();
-        changes.write(&self.dir.join(&segment), self.dim())?;
+        merge::merge(&inputs, self.dim(), &self.dir.join(&segment))?;
         manifest.segments = vec![segment];
         self.commit(manifest)
     }
@@ -297,7 +299,7 @@ mod tests {
     fn reopen(dir: &Path) -> (CollectionStore, BTreeMap<PointId, Vec<f32>>) {
         let mut points = BTreeMap::new();
         let store = CollectionStore::open(dir, StoreOptions::default(), |op| match op {
-            Op::Upsert { id, vector } => {
+            Op::Upsert { id, vector, .. } => {
                 points.insert(id, vector.to_vec());
             }
             Op::Delete { id } => {
@@ -313,6 +315,7 @@ mod tests {
             .write(&[Op::Upsert {
                 id,
                 vector: &[x, x],
+                payload: &[],
             }])
             .unwrap();
     }
@@ -445,10 +448,12 @@ mod tests {
                 Op::Upsert {
                     id: 1,
                     vector: &[1.0, 1.0],
+                    payload: &[],
                 },
                 Op::Upsert {
                     id: 2,
                     vector: &[1.0],
+                    payload: &[],
                 },
             ])
             .unwrap_err();
