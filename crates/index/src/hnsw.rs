@@ -9,6 +9,7 @@
 //! it can't get closer, and finishes with a wider search on layer 0.
 
 mod graph;
+mod insert;
 mod params;
 mod rng;
 mod search;
@@ -22,7 +23,7 @@ use nearby_core::{Error, Metric, PointId, Result, ScoredPoint, validate_vector};
 use self::graph::Graph;
 pub use self::params::HnswParams;
 use self::rng::SplitMix64;
-use self::search::{Neighbor, SearchCtx};
+use self::search::SearchCtx;
 use self::visited::VisitedSet;
 use crate::VectorIndex;
 use crate::store::VectorStore;
@@ -164,6 +165,22 @@ impl Hnsw {
     /// On error the index is left unchanged.
     pub fn insert(&mut self, id: PointId, vector: &[f32]) -> Result<()> {
         validate_vector(vector, self.store.dim())?;
+        let node = self.push(id, vector)?;
+        let mut visited = self.take_visited();
+        let plan = self.plan_links(node, &mut visited);
+        self.return_visited(visited);
+        self.link(&[plan]);
+        Ok(())
+    }
+
+    /// Stores a validated vector as a new node, on a randomly drawn top
+    /// layer but not linked to anything yet, and returns its node id.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParameter`] if the index already holds 2^32 vectors,
+    /// in which case nothing is stored.
+    fn push(&mut self, id: PointId, vector: &[f32]) -> Result<u32> {
         let node = u32::try_from(self.ids.len()).map_err(|_| {
             Error::InvalidParameter("an index holds at most 2^32 vectors".to_owned())
         })?;
@@ -174,73 +191,7 @@ impl Hnsw {
         }
         self.ids.push(id);
         self.graph.add_node(level);
-
-        let Some(entry) = self.entry_point else {
-            // First node: it becomes the entry point, and there's nothing to link.
-            self.entry_point = Some(node);
-            self.max_level = level;
-            return Ok(());
-        };
-
-        let mut visited = self.take_visited();
-        let ctx = self.ctx();
-        let query = ctx.query(vector);
-
-        // Phase 1: above the new node's top layer, just descend greedily.
-        let mut ep = ctx.neighbor(&query, entry);
-        for l in (level + 1..=self.max_level).rev() {
-            ep = ctx.greedy_closest(&query, ep, l, &mut visited);
-        }
-
-        // Phase 2: on every layer the node lives on, find neighbors and link them.
-        for l in (0..=level.min(self.max_level)).rev() {
-            let ctx = self.ctx();
-            let candidates =
-                ctx.search_layer(&query, &[ep], self.params.ef_construction, l, &mut visited);
-            let selected = ctx.select_neighbors(&candidates, self.params.m);
-            ep = candidates[0];
-            self.connect(node, l, &selected);
-        }
-        self.return_visited(visited);
-
-        if level > self.max_level {
-            self.max_level = level;
-            self.entry_point = Some(node);
-        }
-        Ok(())
-    }
-
-    /// Links `node` to `selected` on `level` in both directions.
-    ///
-    /// If a neighbor ends up with too many links, its list is re-selected with
-    /// the same heuristic, using distances measured from *that neighbor*.
-    fn connect(&mut self, node: u32, level: usize, selected: &[Neighbor]) {
-        let links: Vec<u32> = selected.iter().map(|n| n.node).collect();
-        self.graph.set_neighbors(node, level, &links);
-
-        let max_links = self.params.max_links(level);
-        for neighbor in selected {
-            let mut links = self.graph.neighbors(neighbor.node, level).to_vec();
-            if links.len() < max_links {
-                links.push(node);
-            } else {
-                let ctx = self.ctx();
-                let base = ctx.node_query(neighbor.node);
-                let mut candidates: Vec<Neighbor> = links
-                    .iter()
-                    .copied()
-                    .chain([node])
-                    .map(|n| ctx.neighbor(&base, n))
-                    .collect();
-                candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
-                links = ctx
-                    .select_neighbors(&candidates, max_links)
-                    .iter()
-                    .map(|n| n.node)
-                    .collect();
-            }
-            self.graph.set_neighbors(neighbor.node, level, &links);
-        }
+        Ok(node)
     }
 
     /// Draws a node's top layer: `floor(-ln(U) * mL)` for uniform `U` in (0, 1].
