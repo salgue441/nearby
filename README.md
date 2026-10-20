@@ -126,6 +126,25 @@ id 3 at distance 0.0018
 Vectors are validated on the way in: a wrong dimension or a NaN returns an
 `Error` instead of corrupting the index.
 
+## Examples
+
+| Example | What it shows | Run it |
+|---|---|---|
+| [`product_search`](crates/engine/examples/product_search.rs) | A product catalog with payloads: filtered searches (category, stock, price range), restocking and deleting items, and a restart that keeps everything | `cargo run -p nearby-engine --example product_search` |
+| [`index_choice`](crates/engine/examples/index_choice.rs) | Flat, HNSW, PQ and IVF-PQ collections over the same 100,000 vectors: load time, latency and recall side by side | `cargo run -p nearby-engine --release --example index_choice` |
+| [`hnsw_vs_flat`](crates/index/examples/hnsw_vs_flat.rs) | The index crate as a library: exact search against HNSW, and how `ef_search` trades speed for recall | `cargo run -p nearby-index --release --example hnsw_vs_flat` |
+| [`http_api.sh`](examples/http_api.sh) | A curl tour of the HTTP API: payloads, filters, batch search, updates, deletes and metrics | `sh examples/http_api.sh`, with a server running (`NEARBY_URL` and `NEARBY_API_KEY` if needed) |
+
+`index_choice` prints something like this (16 threads):
+
+```text
+index          load  per query  recall@10
+flat       292.86ms     1.99ms      1.000
+hnsw          4.02s    57.95µs      1.000
+pq         991.34ms   827.04µs      1.000
+ivf-pq        1.30s    95.08µs      0.998
+```
+
 ## Performance
 
 200,000 clustered 128-d vectors, 200 queries, k = 10, one thread, on an Intel
