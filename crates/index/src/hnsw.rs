@@ -9,11 +9,13 @@
 //! it can't get closer, and finishes with a wider search on layer 0.
 
 mod graph;
+mod insert;
 mod params;
-mod rng;
+mod persist;
 mod search;
 mod visited;
 
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, PoisonError};
 
 use nearby_core::distance::norm;
@@ -21,15 +23,18 @@ use nearby_core::{Error, Metric, PointId, Result, ScoredPoint, validate_vector};
 
 use self::graph::Graph;
 pub use self::params::HnswParams;
-use self::rng::SplitMix64;
-use self::search::{Neighbor, SearchCtx};
+use self::search::SearchCtx;
 use self::visited::VisitedSet;
 use crate::VectorIndex;
+use crate::rng::SplitMix64;
 use crate::store::VectorStore;
 
 /// Highest layer a node can be assigned. With m = 16, reaching it naturally
 /// would take ~16^16 nodes; the cap only guards against extreme random draws.
 const MAX_LEVEL: usize = 16;
+
+/// Node ids are `u32`, so an index holds at most 2^32 vectors.
+const MAX_NODES: u64 = 1 << 32;
 
 /// An approximate nearest-neighbor index over a layered proximity graph.
 ///
@@ -40,6 +45,8 @@ const MAX_LEVEL: usize = 16;
 ///
 /// Builds are deterministic: the same vectors inserted in the same order with
 /// the same [`HnswParams::seed`] always produce the same graph.
+/// [`Hnsw::insert_batch`] builds on several threads, and its graph does not
+/// depend on how many.
 ///
 /// Internally each vector gets a dense `u32` node id (its insertion position),
 /// which keeps neighbor lists compact; [`ScoredPoint::id`] reports the
@@ -141,6 +148,14 @@ impl Hnsw {
         self.max_level
     }
 
+    /// Every point as `(id, vector)`, in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
+        self.ids
+            .iter()
+            .enumerate()
+            .map(|(node, &id)| (id, self.store.get(node)))
+    }
+
     /// Changes the recall/speed trade-off for later searches. No rebuild needed.
     ///
     /// Larger values explore more of the graph: higher recall, slower
@@ -163,10 +178,75 @@ impl Hnsw {
     /// [`Error::InvalidParameter`] if the index already holds 2^32 vectors.
     /// On error the index is left unchanged.
     pub fn insert(&mut self, id: PointId, vector: &[f32]) -> Result<()> {
-        validate_vector(vector, self.store.dim())?;
-        let node = u32::try_from(self.ids.len()).map_err(|_| {
-            Error::InvalidParameter("an index holds at most 2^32 vectors".to_owned())
-        })?;
+        self.insert_batch(&[(id, vector)], NonZeroUsize::MIN)
+    }
+
+    /// Adds many vectors at once, linking them into the graph on up to
+    /// `threads` threads.
+    ///
+    /// On a multi-core machine this builds an index several times faster
+    /// than calling [`Hnsw::insert`] in a loop, with about the same recall.
+    /// Vectors are linked in chunks of up to a few hundred: every vector in a
+    /// chunk searches the graph as it was before the chunk, all in parallel,
+    /// and is also compared directly with the chunk's earlier vectors.
+    ///
+    /// The graph is deterministic: the same vectors in the same order, with
+    /// the same [`HnswParams::seed`], always give the same graph whatever
+    /// `threads` is. It is not the graph that inserting them one at a time
+    /// would build.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Hnsw::insert`], for any of the vectors. On error
+    /// nothing is inserted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use std::thread;
+    ///
+    /// use nearby_core::Metric;
+    /// use nearby_index::{Hnsw, HnswParams, VectorIndex};
+    ///
+    /// let points: Vec<(u64, [f32; 2])> = (0..1_000u16)
+    ///     .map(|i| (u64::from(i), [f32::from(i % 40), f32::from(i / 40)]))
+    ///     .collect();
+    /// let batch: Vec<(u64, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+    ///
+    /// let threads = thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    /// let mut index = Hnsw::new(2, Metric::L2, HnswParams::default())?;
+    /// index.insert_batch(&batch, threads)?;
+    ///
+    /// assert_eq!(index.len(), 1_000);
+    /// assert_eq!(index.search(&[3.0, 2.0], 1)?[0].id, 83);
+    /// # Ok::<(), nearby_core::Error>(())
+    /// ```
+    pub fn insert_batch(
+        &mut self,
+        points: &[(PointId, &[f32])],
+        threads: NonZeroUsize,
+    ) -> Result<()> {
+        for (_, vector) in points {
+            validate_vector(vector, self.store.dim())?;
+        }
+        let first = self.ids.len();
+        if (first + points.len()) as u64 > MAX_NODES {
+            return Err(Error::InvalidParameter(
+                "an index holds at most 2^32 vectors".to_owned(),
+            ));
+        }
+        for &(id, vector) in points {
+            self.push(id, vector);
+        }
+        self.link_nodes(first..self.ids.len(), threads);
+        Ok(())
+    }
+
+    /// Stores a validated vector as a new node, on a randomly drawn top
+    /// layer but not linked to anything yet. Its node id is the previous
+    /// `len()`, which the caller has checked fits in `u32`.
+    fn push(&mut self, id: PointId, vector: &[f32]) {
         let level = self.random_level();
         self.store.push(vector);
         if self.metric == Metric::Cosine {
@@ -174,73 +254,6 @@ impl Hnsw {
         }
         self.ids.push(id);
         self.graph.add_node(level);
-
-        let Some(entry) = self.entry_point else {
-            // First node: it becomes the entry point, and there's nothing to link.
-            self.entry_point = Some(node);
-            self.max_level = level;
-            return Ok(());
-        };
-
-        let mut visited = self.take_visited();
-        let ctx = self.ctx();
-        let query = ctx.query(vector);
-
-        // Phase 1: above the new node's top layer, just descend greedily.
-        let mut ep = ctx.neighbor(&query, entry);
-        for l in (level + 1..=self.max_level).rev() {
-            ep = ctx.greedy_closest(&query, ep, l, &mut visited);
-        }
-
-        // Phase 2: on every layer the node lives on, find neighbors and link them.
-        for l in (0..=level.min(self.max_level)).rev() {
-            let ctx = self.ctx();
-            let candidates =
-                ctx.search_layer(&query, &[ep], self.params.ef_construction, l, &mut visited);
-            let selected = ctx.select_neighbors(&candidates, self.params.m);
-            ep = candidates[0];
-            self.connect(node, l, &selected);
-        }
-        self.return_visited(visited);
-
-        if level > self.max_level {
-            self.max_level = level;
-            self.entry_point = Some(node);
-        }
-        Ok(())
-    }
-
-    /// Links `node` to `selected` on `level` in both directions.
-    ///
-    /// If a neighbor ends up with too many links, its list is re-selected with
-    /// the same heuristic, using distances measured from *that neighbor*.
-    fn connect(&mut self, node: u32, level: usize, selected: &[Neighbor]) {
-        let links: Vec<u32> = selected.iter().map(|n| n.node).collect();
-        self.graph.set_neighbors(node, level, &links);
-
-        let max_links = self.params.max_links(level);
-        for neighbor in selected {
-            let mut links = self.graph.neighbors(neighbor.node, level).to_vec();
-            if links.len() < max_links {
-                links.push(node);
-            } else {
-                let ctx = self.ctx();
-                let base = ctx.node_query(neighbor.node);
-                let mut candidates: Vec<Neighbor> = links
-                    .iter()
-                    .copied()
-                    .chain([node])
-                    .map(|n| ctx.neighbor(&base, n))
-                    .collect();
-                candidates.sort_by(|a, b| a.distance.total_cmp(&b.distance));
-                links = ctx
-                    .select_neighbors(&candidates, max_links)
-                    .iter()
-                    .map(|n| n.node)
-                    .collect();
-            }
-            self.graph.set_neighbors(neighbor.node, level, &links);
-        }
     }
 
     /// Draws a node's top layer: `floor(-ln(U) * mL)` for uniform `U` in (0, 1].
@@ -290,6 +303,30 @@ impl VectorIndex for Hnsw {
     }
 
     fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+        // Not the default, which goes through `search_filtered`: with a filter
+        // known to keep everything, the check compiles away instead of costing
+        // an extra memory read per visited node.
+        self.search_admitting(query, k, |_| true)
+    }
+
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: &dyn Fn(PointId) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
+        self.search_admitting(query, k, |node| keep(self.ids[node as usize]))
+    }
+}
+
+impl Hnsw {
+    /// Searches for the `k` nodes closest to `query` among those `admit` accepts.
+    fn search_admitting(
+        &self,
+        query: &[f32],
+        k: usize,
+        admit: impl Fn(u32) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.store.dim())?;
         let Some(entry) = self.entry_point else {
             return Ok(Vec::new());
@@ -306,7 +343,7 @@ impl VectorIndex for Hnsw {
             ep = ctx.greedy_closest(&query, ep, l, &mut visited);
         }
         let ef = self.params.ef_search.max(k);
-        let found = ctx.search_layer(&query, &[ep], ef, 0, &mut visited);
+        let found = ctx.search_layer_filtered(&query, &[ep], ef, 0, &mut visited, admit);
         self.return_visited(visited);
 
         Ok(found
@@ -421,6 +458,48 @@ mod tests {
         index
     }
 
+    /// Like [`random_index`], but built with [`Hnsw::insert_batch`].
+    fn random_batch_index(n: usize, dim: usize, params: HnswParams, threads: usize) -> Hnsw {
+        let mut rng = SplitMix64::new(99);
+        let vectors: Vec<Vec<f32>> = (0..n)
+            .map(|_| (0..dim).map(|_| rng.next_f64() as f32).collect())
+            .collect();
+        let batch: Vec<(PointId, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (id as PointId, v.as_slice()))
+            .collect();
+        let mut index = Hnsw::new(dim, Metric::L2, params).unwrap();
+        index
+            .insert_batch(&batch, NonZeroUsize::new(threads).unwrap())
+            .unwrap();
+        index
+    }
+
+    /// Every node's links on every layer it lives on.
+    fn all_links(index: &Hnsw) -> Vec<Vec<u32>> {
+        (0..index.len() as u32)
+            .flat_map(|node| {
+                (0..=index.graph.level(node)).map(move |l| index.graph.neighbors(node, l).to_vec())
+            })
+            .collect()
+    }
+
+    /// Nodes that can't be reached on layer 0 from the entry point.
+    fn unreachable_on_layer0(index: &Hnsw) -> usize {
+        let mut seen = vec![false; index.len()];
+        let mut stack = vec![index.entry_point.unwrap()];
+        seen[stack[0] as usize] = true;
+        while let Some(node) = stack.pop() {
+            for &next in index.graph.neighbors(node, 0) {
+                if !std::mem::replace(&mut seen[next as usize], true) {
+                    stack.push(next);
+                }
+            }
+        }
+        seen.iter().filter(|&&s| !s).count()
+    }
+
     /// Checks every structural invariant the search relies on.
     fn assert_graph_invariants(index: &Hnsw) {
         let n = index.len() as u32;
@@ -472,18 +551,58 @@ mod tests {
     fn every_node_is_reachable_on_layer_0() {
         // Search only works if layer 0 is connected from the entry point.
         let index = random_index(1_000, 8, HnswParams::with_m(6));
-        let mut seen = vec![false; index.len()];
-        let mut stack = vec![index.entry_point.unwrap()];
-        seen[stack[0] as usize] = true;
-        while let Some(node) = stack.pop() {
-            for &next in index.graph.neighbors(node, 0) {
-                if !std::mem::replace(&mut seen[next as usize], true) {
-                    stack.push(next);
-                }
-            }
-        }
-        let unreachable = seen.iter().filter(|&&s| !s).count();
+        let unreachable = unreachable_on_layer0(&index);
         assert_eq!(unreachable, 0, "{unreachable} nodes unreachable on layer 0");
+    }
+
+    #[test]
+    fn batch_insert_keeps_the_graph_valid_and_connected() {
+        // 1000 nodes span every chunk size, up to several full chunks.
+        let index = random_batch_index(1_000, 8, HnswParams::with_m(6), 4);
+        assert_eq!(index.len(), 1_000);
+        assert!(index.max_level() > 0, "upper layers are used");
+        assert_graph_invariants(&index);
+        let unreachable = unreachable_on_layer0(&index);
+        assert_eq!(unreachable, 0, "{unreachable} nodes unreachable on layer 0");
+    }
+
+    #[test]
+    fn batch_insert_builds_the_same_graph_with_any_thread_count() {
+        let params = HnswParams::with_m(6);
+        let one = random_batch_index(1_000, 8, params.clone(), 1);
+        for threads in [2, 5, 16] {
+            let many = random_batch_index(1_000, 8, params.clone(), threads);
+            assert_eq!(all_links(&many), all_links(&one), "{threads} threads");
+            assert_eq!(
+                (many.entry_point, many.max_level),
+                (one.entry_point, one.max_level),
+                "{threads} threads"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_insert_draws_the_same_levels_as_single_inserts() {
+        let params = HnswParams::with_m(6);
+        let single = random_index(500, 8, params.clone());
+        let batch = random_batch_index(500, 8, params, 4);
+        let levels = |index: &Hnsw| -> Vec<usize> {
+            (0..index.len() as u32)
+                .map(|n| index.graph.level(n))
+                .collect()
+        };
+        assert_eq!(levels(&batch), levels(&single));
+    }
+
+    #[test]
+    fn batch_of_one_is_a_single_insert() {
+        let mut single = grid_index();
+        let mut batch = grid_index();
+        single.insert(100, &[4.5, 4.5]).unwrap();
+        batch
+            .insert_batch(&[(100, &[4.5, 4.5])], NonZeroUsize::new(8).unwrap())
+            .unwrap();
+        assert_eq!(all_links(&batch), all_links(&single));
     }
 
     #[test]
@@ -493,6 +612,16 @@ mod tests {
         index.insert(7, &[1.0]).unwrap();
         assert_eq!(index.entry_point, Some(0));
         assert_eq!(index.max_level, index.graph.level(0));
+    }
+
+    #[test]
+    fn iter_yields_points_in_insertion_order() {
+        let index = grid_index();
+        let points: Vec<(PointId, Vec<f32>)> =
+            index.iter().map(|(id, v)| (id, v.to_vec())).collect();
+        assert_eq!(points.len(), 100);
+        assert_eq!(points[0], (0, vec![0.0, 0.0]));
+        assert_eq!(points[23], (23, vec![3.0, 2.0]));
     }
 
     #[test]

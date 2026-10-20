@@ -4,18 +4,21 @@
 //!   so it is the ground truth the approximate indexes are measured against.
 //! - [`Hnsw`]: approximate search over a layered proximity graph. Much
 //!   faster on large data; recall is tuned with [`HnswParams`].
-//!
-//! Product quantization is planned and will implement the same
-//! [`VectorIndex`] trait.
+//! - [`PqIndex`]: approximate search over vectors compressed by a
+//!   [`ProductQuantizer`]. Far less memory per vector, lower recall.
 
-use nearby_core::{Result, ScoredPoint};
+use nearby_core::{PointId, Result, ScoredPoint};
 
 mod flat;
 mod hnsw;
+mod parallel;
+mod pq;
+mod rng;
 mod store;
 
 pub use flat::FlatIndex;
 pub use hnsw::{Hnsw, HnswParams};
+pub use pq::{PqIndex, PqParams, ProductQuantizer};
 
 /// What every index can do once it's built.
 ///
@@ -45,5 +48,24 @@ pub trait VectorIndex: Send + Sync {
     /// [`nearby_core::Error::DimensionMismatch`] if `query` has the wrong
     /// length, or [`nearby_core::Error::InvalidVector`] if it contains NaN
     /// or infinite values.
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>>;
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+        self.search_filtered(query, k, &|_| true)
+    }
+
+    /// Like [`VectorIndex::search`], but only returns points for which
+    /// `keep(id)` is true, for example to skip deleted points.
+    ///
+    /// Exact indexes simply skip the rest. Graph indexes still walk through
+    /// rejected points to reach others, so recall holds up, but the more
+    /// points are rejected, the more of the graph a search visits.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`VectorIndex::search`].
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: &dyn Fn(PointId) -> bool,
+    ) -> Result<Vec<ScoredPoint>>;
 }

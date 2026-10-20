@@ -3,6 +3,8 @@
 //! Integration tests live in `tests/` and compile as a separate crate, so they
 //! can only use what `nearby_index` exports, exactly like a real user would.
 
+use std::num::NonZeroUsize;
+
 use nearby_core::{Metric, PointId};
 use nearby_index::{FlatIndex, Hnsw, HnswParams, VectorIndex};
 
@@ -97,4 +99,29 @@ fn every_point_finds_itself() {
     for (i, v) in data.iter().enumerate() {
         assert_eq!(hnsw.search(v, 1).unwrap()[0].id, i as PointId);
     }
+}
+
+#[test]
+fn batch_insert_recall_matches_single_inserts() {
+    let data = random_vectors(2_000, DIM, 8);
+    let queries = random_vectors(50, DIM, 9);
+    let (single, flat) = build(Metric::L2, test_params(), &data);
+
+    let points: Vec<(PointId, &[f32])> = data
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as PointId, v.as_slice()))
+        .collect();
+    let mut batch = Hnsw::new(DIM, Metric::L2, test_params()).unwrap();
+    batch
+        .insert_batch(&points, NonZeroUsize::new(4).unwrap())
+        .unwrap();
+
+    let single_recall = mean_recall(&single, &flat, &queries);
+    let batch_recall = mean_recall(&batch, &flat, &queries);
+    assert!(batch_recall >= 0.95, "batch recall@{K} = {batch_recall:.3}");
+    assert!(
+        batch_recall >= single_recall - 0.02,
+        "batch {batch_recall:.3} vs single inserts {single_recall:.3}"
+    );
 }

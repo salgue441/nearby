@@ -4,8 +4,9 @@
 
 **A vector database in Rust, built from first principles.**
 
-Exact and approximate nearest-neighbor search, SIMD distance kernels, and a
-benchmark harness that keeps every optimization honest.
+Exact, graph and compressed nearest-neighbor search, a crash-safe storage
+engine, an HTTP API, and a benchmark harness that keeps every optimization
+honest.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust: stable, 2024 edition](https://img.shields.io/badge/rust-stable%20%C2%B7%202024%20edition-orange.svg)](rust-toolchain.toml)
@@ -17,6 +18,9 @@ benchmark harness that keeps every optimization honest.
 
 ## Highlights
 
+- **A complete database.** Named collections with upserts, deletes and
+  search over an HTTP + JSON API, kept durable by a checksummed write-ahead
+  log and immutable segments, and recovered exactly after a crash.
 - **Exact and approximate search behind one trait.** `FlatIndex` is always
   correct; `Hnsw` answers about 30× faster at 99% recall on 200k vectors
   ([synthetic data](#performance)).
@@ -29,6 +33,12 @@ benchmark harness that keeps every optimization honest.
 - **Memory-aware HNSW.** Neighbor vectors are prefetched before they are
   measured, visited sets are pooled and reset in O(1), and searches take
   `&self`, so many threads can query one index at once.
+- **Parallel, deterministic builds.** `insert_batch` links vectors on every
+  core (3.6× faster on SIFT1M with 16 threads) and builds the same graph
+  whatever the thread count.
+- **Compressed vectors.** `PqIndex` stores each 128-d vector in 16 bytes
+  (32× smaller) with product quantization, searched through per-query lookup
+  tables.
 - **Reproducible by design.** Seeded graph construction, deterministic tie
   breaking, and identical results across runs on a given machine.
 - **Measured, not guessed.** Every optimization in the history comes with
@@ -37,7 +47,26 @@ benchmark harness that keeps every optimization honest.
 
 ## Quick start
 
-Nearby isn't on crates.io yet. Depend on the crates by path (or git):
+Run the server (it stores data in `./data` and listens on `127.0.0.1:7700`):
+
+```sh
+cargo run -p nearby-server --release
+```
+
+Then create a collection, add points and search:
+
+```sh
+curl -X PUT localhost:7700/collections/docs -H 'content-type: application/json' \n  -d '{"dim": 3, "metric": "cosine", "index": {"type": "hnsw"}}'
+
+curl -X PUT localhost:7700/collections/docs/points -H 'content-type: application/json' \n  -d '{"points": [{"id": 1, "vector": [1, 0, 0]}, {"id": 2, "vector": [0, 1, 0]},
+                  {"id": 3, "vector": [0.9, 0.1, 0]}]}'
+
+curl -X POST localhost:7700/collections/docs/search -H 'content-type: application/json' \n  -d '{"vector": [1, 0.05, 0], "k": 2}'
+# {"results":[{"id":1,"distance":0.0012476444},{"id":3,"distance":0.0018416047}]}
+```
+
+The indexes can also be used directly as a library. Nearby isn't on crates.io
+yet, so depend on the crates by path (or git):
 
 ```toml
 [dependencies]
@@ -93,7 +122,12 @@ Tiger Lake laptop (`cargo run -p nearby-bench --release`, default target):
 | `Hnsw`, `ef_search = 160` | 0.9920 | 181 µs | 5,527 |
 | `Hnsw`, `ef_search = 320` | 0.9945 | 266 µs | 3,760 |
 
-Building the HNSW index (`m = 16`, `ef_construction = 200`) takes 25 s.
+Building the HNSW index (`m = 16`, `ef_construction = 200`) one vector at a
+time takes 25 s.
+
+On SIFT1M (1M real 128-d descriptors, same machine and parameters),
+`insert_batch` cuts the build from 367 s to 101 s with 16 threads, at the
+same recall (0.9932 at `ef_search = 160`).
 
 > [!NOTE]
 > These are synthetic vectors, so treat them as indicative. Recall depends
@@ -110,21 +144,78 @@ point toward `nearby-core`.
 graph TD
     bench["nearby-bench<br/><i>binary</i>"] --> index["nearby-index"]
     bench --> core["nearby-core"]
-    server["nearby-server<br/><i>binary</i>"] --> engine["nearby-engine<br/><i>planned</i>"]
+    server["nearby-server<br/><i>binary</i>"] --> engine["nearby-engine"]
     server --> core
     index --> core
-    engine -.-> index
-    engine -.-> storage["nearby-storage<br/><i>planned</i>"]
+    engine --> index
+    engine --> storage["nearby-storage"]
+    engine --> core
+    storage --> core
 ```
 
 | Crate | Responsibility |
 |---|---|
 | `nearby-core` | Shared types (`PointId`, `Metric`, `ScoredPoint`), the error type, distance kernels and the `TopK` collector. |
-| `nearby-index` | The `VectorIndex` trait, `FlatIndex` and `Hnsw`. |
-| `nearby-engine` | *Planned.* Collections, the id map and query execution. |
-| `nearby-storage` | *Planned.* Segments, the write-ahead log and recovery. |
-| `nearby-server` | Configuration and logging. The network API is not implemented yet. |
+| `nearby-index` | The `VectorIndex` trait, `FlatIndex`, `Hnsw` and `PqIndex` (product quantization). |
+| `nearby-engine` | Collections, the id map, deletes and query execution, on top of indexes and storage. |
+| `nearby-storage` | The write-ahead log, segments, compaction and recovery. |
+| `nearby-server` | The HTTP + JSON API, configuration and logging. |
 | `nearby-bench` | Recall, throughput and latency benchmark on TEXMEX datasets. |
+
+<details>
+<summary><b>Storage: <code>nearby-storage</code></b></summary>
+
+Each collection lives in its own directory, managed by a `CollectionStore`:
+
+```text
+data/collections/docs/
+├── collection.toml   dimension, metric and index settings
+├── index.snapshot    HNSW graph and id map, saved on shutdown (a cache)
+├── MANIFEST          which log and segments are live
+├── wal-000007.log    writes since the last flush
+├── seg-000004.seg    immutable batches of net changes, oldest first
+└── seg-000006.seg
+```
+
+- **Write-ahead log.** Every write is appended as a CRC-32 checksummed record
+  and, with `durability = "sync"`, synced before it is acknowledged. A batch
+  upsert is one record batch and one sync.
+- **Segments.** Once the log holds `flush_after_ops` writes, its net changes
+  (the last write per id wins) become an immutable segment and a new log
+  starts. When there are more than `max_segments`, they are compacted into
+  one segment of live points.
+- **Atomic switches.** New files are fully written and synced before a new
+  `MANIFEST` is atomically renamed into place, so a crash at any moment
+  leaves either the old set of files or the new one. Leftovers are deleted
+  on the next open.
+- **Recovery** replays the segments oldest first, then the log. A record cut
+  short by a crash fails its length or checksum check and is truncated away;
+  everything acknowledged before it is kept.
+
+</details>
+
+<details>
+<summary><b>Collections: <code>nearby-engine</code></b></summary>
+
+A `Database` holds named collections, each with a fixed dimension, metric and
+index (`flat` or `hnsw`, with its parameters).
+
+- **Ids** are chosen by the caller. Writing an existing id replaces the point.
+- **Deletes and replacements.** Indexes only append, so an old vector stays
+  in the index, marked dead, and searches skip it with
+  `VectorIndex::search_filtered`. HNSW still walks through dead nodes to
+  reach live ones, so recall holds. Once dead vectors outnumber live ones,
+  the index is rebuilt without them.
+- **Restarts.** On shutdown, each HNSW collection saves a snapshot of its
+  graph and id map, tagged with the storage generation it matches. On start,
+  a matching snapshot is loaded and only the log written since is replayed;
+  otherwise (a crash after a flush, a damaged file) the index is rebuilt
+  from storage. On SIFT1M, a restart takes 1.8 s instead of 87 s (the
+  snapshot is 591 MB and takes 1.7 s to write).
+- **Concurrency.** Each collection has its own read-write lock: searches run
+  alongside each other, and writes to one collection don't block others.
+
+</details>
 
 <details>
 <summary><b>Design rules</b></summary>
@@ -187,6 +278,13 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 - **Allocation-free visited sets.** Searches borrow a set from a pool, and a
   generation counter clears it in O(1).
 - **Reproducible builds.** Layers come from a seeded `SplitMix64`.
+- **Parallel builds.** `insert_batch` links vectors in chunks of up to 256.
+  Every vector in a chunk searches the graph as it was before the chunk, all
+  in parallel, and is compared directly with the chunk's earlier vectors,
+  which that graph can't reach yet. Back-link pruning is independent per
+  neighbor list, so it runs in parallel too. Chunk sizes depend only on the
+  graph size, so the graph is the same for any thread count (though not the
+  one inserting vectors one at a time builds), and recall matches.
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -201,6 +299,48 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 > to the same few nodes, and later copies lose their incoming links when
 > those lists are pruned. This is inherent to HNSW (hnswlib behaves the same
 > way). Deduplicate before indexing.
+
+</details>
+
+<details>
+<summary><b>Compressed search: <code>PqIndex</code></b></summary>
+
+`PqIndex` implements product quantization (Jégou, Douze & Schmid, 2011).
+Each vector is split into `subspaces` equal slices, and each slice is replaced
+by the index of its nearest centroid among 256: one byte. A 128-d vector of
+512 bytes becomes 16 bytes with 16 subspaces.
+
+```rust
+let pq = ProductQuantizer::train(dim, Metric::L2, &PqParams::default(), &training, threads)?;
+let mut index = PqIndex::new(pq);
+index.add_batch(&points, threads)?;
+```
+
+- **Training** runs k-means per subspace: k-means++ seeding, then Lloyd
+  iterations until nothing moves or `iterations` is reached. An empty
+  cluster restarts at the point farthest from its centroid. Subspaces train
+  in parallel, and the codebooks depend only on the data and `seed`.
+- **Searching** never decodes a vector. The query is measured against every
+  centroid once, filling a `subspaces × 256` table; each stored vector then
+  costs one lookup per subspace, summed into four independent accumulators.
+- **Metrics.** L2 and dot product are approximated directly; cosine works on
+  normalized vectors.
+- Only codes and ids are stored, so results can't be re-ranked with exact
+  distances yet.
+
+SIFT1M, 100k training vectors, 10k queries, 16 threads:
+
+| Index | Bytes/vector | Recall@10 | Mean latency | Train + encode |
+|---|---:|---:|---:|---:|
+| `FlatIndex` | 512 | 0.9994 | 30.4 ms | – |
+| `PqIndex`, 16 subspaces | 16 | 0.5452 | 7.4 ms | 7.7 s + 6.2 s |
+| `PqIndex`, 32 subspaces | 32 | 0.7215 | 14.4 ms | 9.9 s + 8.8 s |
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `subspaces` | 16 | Code bytes per vector; must divide the dimension. More: better recall, more memory, slower searches. |
+| `iterations` | 25 | Maximum k-means iterations per subspace. |
+| `seed` | `0x5EED` | Seed for k-means++ seeding. |
 
 </details>
 
@@ -263,10 +403,13 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | Option | Default | Meaning |
 |---|---|---|
 | `DATASET_DIR` | `data/siftsmall` | Dataset directory. |
-| `--index flat\|hnsw\|both` | `both` | Which indexes to build and query. |
+| `--index LIST` | `both` | Indexes to build and query, comma-separated: `flat`, `hnsw`, `pq`, or `both` (flat and hnsw) or `all`. ||hnsw\|both` | `both` | Which indexes to build and query. |
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
+| `--pq-subspaces N` | `16` | PQ code bytes per vector. Must divide the dimension. |
+| `--pq-train N` | `100000` | Base vectors, from the front of the file, that PQ is trained on. |
+| `--threads N` | all available | Threads that build HNSW (`insert_batch`) and train and encode PQ. Results are the same for any value. |
 | `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, one result row each. Values below `k` run as `k`, and each row is labeled with the `ef` it actually used. |
 | `-h`, `--help` | | Print usage. |
 
@@ -283,7 +426,7 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 dataset  siftsmall: 10000 base vectors, 100 queries, dim 128
 
 build    flat: ...
-build    hnsw (m=16, ef_construction=200): ..., ... layers
+build    hnsw (m=16, ef_construction=200, threads=16): ..., ... layers
 
 index          recall@10       qps       mean        p50        p95        p99        max
 flat              1.0000       ...        ...        ...        ...        ...        ...
@@ -295,7 +438,10 @@ hnsw ef=10           ...       ...        ...        ...        ...        ...  
   construction; the line also reports the number of layers.
 - **recall@k**: the average fraction of each query's true `k` nearest
   neighbors found among the first `k` results. The flat index is exact, so
-  anything below 1.0000 there is a bug.
+  it only falls short of 1.0000 on ties: when several vectors are exactly as
+  far as the `k`-th neighbor, it keeps the lowest ids, which may not be the
+  ones the ground truth lists. SIFT1M has duplicate vectors, so its flat
+  recall is 0.9994; every miss there is such a tie.
 - **qps**: queries per second, run one after another on a single thread.
 - **mean … max**: per-query latency, with nearest-rank percentiles. Tail
   latencies (p95, p99) are what the slowest requests experience.
@@ -314,13 +460,56 @@ cargo run -p nearby-server -- [path/to/nearby.toml]
 
 The config path defaults to `nearby.toml`. A missing file means all defaults;
 unknown keys are rejected, and an invalid `RUST_LOG` stops startup with an
-error rather than being ignored.
+error rather than being ignored. Ctrl-C (or SIGTERM on Unix) stops accepting
+requests and flushes every collection before exiting.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/health` | | `{"status": "ok"}` |
+| `GET` | `/collections` | | `{"collections": ["docs"]}` |
+| `PUT` | `/collections/{name}` | `{"dim": 128, "metric": "cosine", "index": {"type": "hnsw", "m": 16}}` | `201` and collection info |
+| `GET` | `/collections/{name}` | | collection info: config, point count, segments |
+| `DELETE` | `/collections/{name}` | | `204` |
+| `PUT` | `/collections/{name}/points` | `{"points": [{"id": 1, "vector": [...]}]}` | `{"upserted": 1}` |
+| `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": 2}` |
+| `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...]}` |
+| `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10}` | `{"results": [{"id": 1, "distance": 0.12}]}` |
+
+- **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
+  `index` is `{"type": "flat"}` or `{"type": "hnsw"}`, optionally with `m`,
+  `ef_construction` and `ef_search`. Names are 1 to 64 ASCII letters,
+  digits, `-` or `_`.
+- **Errors** come back as `{"error": "..."}`: `400` for invalid input, `404`
+  for a missing collection or point, `409` for a name that's taken, `413`
+  for a body over `max_body_bytes`, `422` for JSON of the wrong shape.
+- `k` defaults to 10 and is at most 10,000. Ties come back in write order.
+
+- **Authentication.** Set `api_key` under `[server]`, or the `NEARBY_API_KEY`
+  environment variable, and every endpoint but `/health` requires
+  `Authorization: Bearer <key>`, answering `401` without it.
+
+> [!WARNING]
+> Without an API key, every request is accepted. The server listens on
+> `127.0.0.1` by default; set a key, and terminate TLS in front of it (the
+> key travels in a header), before exposing it on a network.
 
 <details>
 <summary><b>Every configuration key and its default</b></summary>
 
 ```toml
 data_dir = "./data"
+
+[server]
+listen = "127.0.0.1:7700"
+max_body_bytes = 67108864 # 64 MiB
+# api_key = "..."        # require "Authorization: Bearer <key>"; NEARBY_API_KEY overrides it
+
+[engine]
+durability = "sync"       # "sync": every write is on disk before it's acknowledged
+                          # "nosync": leave syncing to the OS (survives a crash, not power loss)
+threads = 0               # threads that build indexes; 0 uses every core
+flush_after_ops = 50000   # log writes before they are flushed into a segment
+max_segments = 8          # segments kept before they are compacted into one
 
 [log]
 level = "info"            # tracing filter directive; RUST_LOG overrides it
@@ -362,11 +551,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] HNSW approximate search
 - [x] SIMD distance kernels (AVX2 + FMA, runtime dispatch)
 - [x] Benchmark harness with recall, latency percentiles and `ef` sweeps
-- [ ] Parallel HNSW construction
-- [ ] Product quantization
-- [ ] Engine: collections, id map, deduplication and deletes
-- [ ] Storage: segments, write-ahead log and recovery
-- [ ] Server network API
+- [x] Parallel HNSW construction
+- [x] Product quantization
+- [x] Engine: collections, id map, deduplication and deletes
+- [x] Storage: segments, write-ahead log and recovery
+- [x] Server network API
+
+Possible next steps: PQ as a collection index (with exact re-ranking from storage), metadata
+filters on search, and authentication for the API.
 
 ## License
 

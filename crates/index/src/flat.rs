@@ -125,7 +125,12 @@ impl VectorIndex for FlatIndex {
         self.ids.len()
     }
 
-    fn search(&self, query: &[f32], k: usize) -> Result<Vec<ScoredPoint>> {
+    fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: &dyn Fn(PointId) -> bool,
+    ) -> Result<Vec<ScoredPoint>> {
         validate_vector(query, self.dim)?;
 
         let mut top = TopK::new(k);
@@ -134,11 +139,13 @@ impl VectorIndex for FlatIndex {
         if self.stores_norms() {
             let query_norm = norm(query);
             for ((vector, &id), &vector_norm) in vectors.zip(&self.norms) {
-                let d = cosine_distance_with_norms(query, vector, query_norm, vector_norm);
-                top.push(id, d);
+                if keep(id) {
+                    let d = cosine_distance_with_norms(query, vector, query_norm, vector_norm);
+                    top.push(id, d);
+                }
             }
         } else {
-            for (vector, &id) in vectors {
+            for (vector, &id) in vectors.filter(|&(_, &id)| keep(id)) {
                 top.push(id, self.metric.distance(query, vector));
             }
         }

@@ -3,9 +3,12 @@
 //! Every field has a default, so an empty file (or no file) is a valid config.
 //! Unknown keys are rejected so typos fail loudly instead of being ignored.
 
+use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use nearby_engine::{Durability, EngineOptions};
 use serde::Deserialize;
 
 /// Top-level server configuration.
@@ -14,6 +17,10 @@ use serde::Deserialize;
 pub struct Config {
     /// Where collections and their segments are stored. Default: `./data`.
     pub data_dir: PathBuf,
+    /// Network settings, from the `[server]` table.
+    pub server: ServerConfig,
+    /// Storage and indexing settings, from the `[engine]` table.
+    pub engine: EngineConfig,
     /// Logging settings, from the `[log]` table.
     pub log: LogConfig,
 }
@@ -22,6 +29,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
+            server: ServerConfig::default(),
+            engine: EngineConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -64,6 +73,88 @@ impl Config {
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
     }
+}
+
+/// The `[server]` table: where the HTTP API listens.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    /// Address and port to listen on. Default: `127.0.0.1:7700`, reachable
+    /// from this machine only; use `0.0.0.0:7700` to listen everywhere.
+    pub listen: SocketAddr,
+    /// Largest request body accepted, in bytes. Default: 64 MiB.
+    pub max_body_bytes: usize,
+    /// When set, every endpoint but `/health` requires
+    /// `Authorization: Bearer <api_key>`. The `NEARBY_API_KEY` environment
+    /// variable, when set, takes precedence, so the key can stay out of the
+    /// file. Default: none (no authentication).
+    pub api_key: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: SocketAddr::from(([127, 0, 0, 1], 7700)),
+            max_body_bytes: 64 << 20,
+            api_key: None,
+        }
+    }
+}
+
+/// The `[engine]` table: durability and indexing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EngineConfig {
+    /// `"sync"` forces every write to disk before it is acknowledged;
+    /// `"nosync"` leaves that to the OS, surviving a crash of the server but
+    /// not of the machine. Default: `"sync"`.
+    pub durability: DurabilityConfig,
+    /// Threads that build indexes. `0` uses every core. Default: `0`.
+    pub threads: usize,
+    /// Writes a collection's log holds before it is flushed into a
+    /// segment. Default: `50000`.
+    pub flush_after_ops: usize,
+    /// Segments a collection keeps before they are merged. Default: `8`.
+    pub max_segments: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        let defaults = EngineOptions::default();
+        Self {
+            durability: DurabilityConfig::Sync,
+            threads: 0,
+            flush_after_ops: defaults.flush_after_ops,
+            max_segments: defaults.max_segments,
+        }
+    }
+}
+
+impl EngineConfig {
+    /// The engine options these settings stand for.
+    pub fn options(&self) -> EngineOptions {
+        let defaults = EngineOptions::default();
+        EngineOptions {
+            durability: match self.durability {
+                DurabilityConfig::Sync => Durability::Sync,
+                DurabilityConfig::NoSync => Durability::NoSync,
+            },
+            threads: NonZeroUsize::new(self.threads).unwrap_or(defaults.threads),
+            flush_after_ops: self.flush_after_ops.max(1),
+            max_segments: self.max_segments.max(1),
+        }
+    }
+}
+
+/// When writes reach the disk. Written in lowercase in TOML (`"nosync"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DurabilityConfig {
+    /// Every write is synced before it is acknowledged.
+    #[default]
+    Sync,
+    /// Writes are left to the OS to sync.
+    NoSync,
 }
 
 /// The `[log]` table: where logs go and how much is written.
@@ -183,7 +274,13 @@ mod tests {
     #[test]
     fn defaults_are_documented_values() {
         let cfg = Config::default();
-        assert_eq!(cfg.data_dir, PathBuf::from("./data"));
+        assert_eq!(cfg.server.listen.to_string(), "127.0.0.1:7700");
+        assert_eq!(cfg.server.max_body_bytes, 64 << 20);
+        assert_eq!(cfg.server.api_key, None);
+        assert_eq!(cfg.engine.durability, DurabilityConfig::Sync);
+        assert_eq!(cfg.engine.threads, 0);
+        assert_eq!(cfg.engine.flush_after_ops, 50_000);
+        assert_eq!(cfg.engine.max_segments, 8);
 
         let log = cfg.log;
         assert_eq!(log.level, "info");
@@ -194,6 +291,48 @@ mod tests {
         assert_eq!(log.file_prefix, "nearby");
         assert_eq!(log.rotation, Rotation::Daily);
         assert_eq!(log.max_files, 14);
+    }
+
+    #[test]
+    fn server_and_engine_tables_parse() {
+        let cfg = Config::from_toml(
+            r#"
+            [server]
+            listen = "0.0.0.0:9000"
+            api_key = "k3y"
+            [engine]
+            durability = "nosync"
+            threads = 3
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.server.listen.port(), 9000);
+        assert_eq!(cfg.server.api_key.as_deref(), Some("k3y"));
+        let options = cfg.engine.options();
+        assert_eq!(options.durability, Durability::NoSync);
+        assert_eq!(options.threads.get(), 3);
+        assert_eq!(options.flush_after_ops, 50_000);
+
+        assert!(
+            Config::from_toml(
+                "[server]
+listen = \"nowhere\""
+            )
+            .is_err()
+        );
+        assert!(
+            Config::from_toml(
+                "[engine]
+durability = \"maybe\""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn zero_threads_means_every_core() {
+        let options = EngineConfig::default().options();
+        assert_eq!(options.threads, EngineOptions::default().threads);
     }
 
     #[test]
