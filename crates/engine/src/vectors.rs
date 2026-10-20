@@ -10,7 +10,8 @@ use nearby_core::Result;
 
 /// File names start with this; anything else in the directory is left alone.
 const PREFIX: &str = "vectors-";
-const SUFFIX: &str = ".tmp";
+/// Not `.tmp`: storage deletes `*.tmp` files it finds as its own leftovers.
+const SUFFIX: &str = ".spill";
 
 /// Vectors appended to a memory-mapped file in a collection directory, so a
 /// compressed index can keep only its codes in RAM.
@@ -131,6 +132,7 @@ impl Drop for VectorFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nearby_storage::{CollectionStore, Op, StoreOptions};
 
     #[test]
     fn appended_vectors_read_back() {
@@ -171,7 +173,7 @@ mod tests {
 
         drop(second);
         // As if a crashed process had left its file behind.
-        fs::write(dir.path().join("vectors-1-0.tmp"), [0; 4]).unwrap();
+        fs::write(dir.path().join("vectors-1-0.spill"), [0; 4]).unwrap();
         fs::write(dir.path().join("MANIFEST"), "keep").unwrap();
         VectorFile::remove_leftovers(dir.path()).unwrap();
         let left: Vec<_> = fs::read_dir(dir.path())
@@ -179,6 +181,23 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec!["MANIFEST"]);
+    }
+
+    #[test]
+    fn storage_leaves_spill_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = CollectionStore::create(dir.path(), 1, StoreOptions::default()).unwrap();
+        let mut file = VectorFile::create(dir.path(), 1).unwrap();
+        file.append([&[1.0][..]]).unwrap();
+        // A flush commits a new manifest and sweeps files storage owns.
+        store
+            .write(&[Op::Upsert {
+                id: 1,
+                vector: &[1.0],
+            }])
+            .unwrap();
+        store.flush().unwrap();
+        assert!(file.path.exists());
     }
 
     #[test]

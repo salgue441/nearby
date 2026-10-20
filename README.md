@@ -171,7 +171,7 @@ Each collection lives in its own directory, managed by a `CollectionStore`:
 data/collections/docs/
 ├── collection.toml   dimension, metric and index settings
 ├── index.snapshot    HNSW graph and id map, saved on shutdown (a cache)
-├── vectors-*.tmp     a PQ collection's full vectors, memory-mapped (scratch)
+├── vectors-*.spill   a PQ collection's full vectors, memory-mapped (scratch)
 ├── MANIFEST          which log and segments are live
 ├── wal-000007.log    writes since the last flush
 ├── seg-000004.seg    immutable batches of net changes, oldest first
