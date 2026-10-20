@@ -342,12 +342,7 @@ impl Dataset {
     ) -> anyhow::Result<()> {
         assert!(max > 0, "chunks must hold at least one vector");
         let context = || format!("parsing {}", self.base_path.display());
-        let mut reader = VecsReader::open_fvecs(&self.base_path)?;
-        ensure!(
-            (reader.dim(), reader.len()) == (self.dim, self.base_len),
-            "{} changed since it was loaded",
-            self.base_path.display()
-        );
+        let mut reader = self.open_base()?;
 
         let mut chunk = Vec::with_capacity(max * self.dim);
         let mut first = 0;
@@ -365,6 +360,43 @@ impl Dataset {
             f(first, &chunk)?;
             first += chunk.len() / self.dim;
         }
+    }
+
+    /// Reads the first `n` base vectors (all of them if there are fewer)
+    /// into memory, for example to train a quantizer on.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Dataset::for_each_base_chunk`], except for `f`.
+    pub fn read_base_prefix(&self, n: usize) -> anyhow::Result<Vectors> {
+        let context = || format!("parsing {}", self.base_path.display());
+        let mut reader = self.open_base()?;
+        let n = n.min(self.base_len);
+        let mut data = Vec::with_capacity(n * self.dim);
+        for _ in 0..n {
+            let vector = reader.next_vector().with_context(context)?;
+            data.extend_from_slice(
+                vector
+                    .context("base file ended early")
+                    .with_context(context)?,
+            );
+        }
+        Ok(Vectors {
+            dim: self.dim,
+            data,
+        })
+    }
+
+    /// Opens the base file and checks it still has the shape seen by
+    /// [`Dataset::load`].
+    fn open_base(&self) -> anyhow::Result<VecsReader<BufReader<File>, f32>> {
+        let reader = VecsReader::open_fvecs(&self.base_path)?;
+        ensure!(
+            (reader.dim(), reader.len()) == (self.dim, self.base_len),
+            "{} changed since it was loaded",
+            self.base_path.display()
+        );
+        Ok(reader)
     }
 }
 
@@ -681,6 +713,27 @@ mod tests {
             seen,
             vec![(0, vec![0.0, 1.0]), (2, vec![2.0, 3.0]), (4, vec![4.0])]
         );
+    }
+
+    #[test]
+    fn base_prefix_reads_the_first_vectors() {
+        let root = tempfile::tempdir().unwrap();
+        let base: Vec<[f32; 2]> = (0..5u8).map(|i| [f32::from(i), 0.5]).collect();
+        let refs: Vec<&[f32]> = base.iter().map(|v| &v[..]).collect();
+        let dir = write_dataset(root.path(), "prefix", &refs, &[&[0.0, 0.0]], &[&[0]]);
+        let data = Dataset::load(&dir, 1).unwrap();
+
+        let first = data.read_base_prefix(2).unwrap();
+        assert_eq!(
+            (first.dim, first.data.clone()),
+            (2, vec![0.0, 0.5, 1.0, 0.5])
+        );
+        assert_eq!(
+            data.read_base_prefix(100).unwrap().len(),
+            5,
+            "capped at the base size"
+        );
+        assert_eq!(data.read_base_prefix(0).unwrap().len(), 0);
     }
 
     #[test]
