@@ -1,10 +1,12 @@
 //! The PQ backend: exact search until there is enough data to train a
 //! quantizer, product-quantized codes after.
 
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use nearby_core::{Metric, PointId, Result, ScoredPoint};
+use nearby_core::checksum::{CrcReader, CrcWriter};
+use nearby_core::{Error, Metric, PointId, Result, ScoredPoint};
 use nearby_index::{FlatIndex, IvfPqIndex, IvfPqParams, PqIndex, ProductQuantizer, VectorIndex};
 
 use crate::backend::IndexBackend;
@@ -174,6 +176,178 @@ impl IndexBackend for PqBackend {
         let trained = matches!(self.state, State::Trained(_));
         trained.then(|| NonZeroUsize::new(self.config.rerank).expect("validated in new"))
     }
+
+    fn can_save(&self) -> bool {
+        true
+    }
+
+    /// Writes the backend for a snapshot:
+    ///
+    /// ```text
+    /// magic "NBPQBK01", state u8 (0 collecting, 1 codes, 2 clustered codes),
+    /// vector count u64, vectors f32 × count × dim, crc32 of the above u32,
+    /// then for states 1 and 2 the codes, in PqIndex or IvfPqIndex format
+    /// ```
+    fn save(&self, w: &mut dyn Write) -> Result<()> {
+        let mut header = CrcWriter::new(&mut *w);
+        header.write_all(&MAGIC)?;
+        let tag = match &self.state {
+            State::Collecting(_) => 0,
+            State::Trained(Codes::Flat(_)) => 1,
+            State::Trained(Codes::Ivf(_)) => 2,
+        };
+        header.write_all(&[tag])?;
+        header.write_all(&(self.vectors.len() as u64).to_le_bytes())?;
+        let mut bytes = Vec::new();
+        for slot in 0..self.vectors.len() {
+            bytes.clear();
+            for value in self.vectors.get(slot) {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            header.write_all(&bytes)?;
+        }
+        let crc = header.crc();
+        w.write_all(&crc.to_le_bytes())?;
+        match &self.state {
+            State::Collecting(_) => Ok(()),
+            State::Trained(Codes::Flat(pq)) => pq.write_to(w),
+            State::Trained(Codes::Ivf(ivf)) => ivf.write_to(w),
+        }
+    }
+}
+
+/// Starts a PQ backend's section of a snapshot.
+const MAGIC: [u8; 8] = *b"NBPQBK01";
+
+/// Vectors read and spilled at a time when loading a snapshot.
+const LOAD_CHUNK: usize = 4096;
+
+impl PqBackend {
+    /// Restores a backend written by [`IndexBackend::save`], spilling its
+    /// vectors to `dir`. `Ok(None)` means it was saved with other settings.
+    /// The restored backend holds exactly `slots` points, point `s` in slot
+    /// `s`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corruption`] (naming "PQ backend") if the data is damaged or
+    /// inconsistent, or an I/O error.
+    pub(crate) fn load(
+        dim: usize,
+        metric: Metric,
+        config: &PqConfig,
+        dir: &Path,
+        r: &mut dyn Read,
+        slots: usize,
+    ) -> Result<Option<Self>> {
+        let corrupt = |reason: &str| Error::corruption("PQ backend", reason);
+        let mut backend = Self::new(dim, metric, config, dir)?;
+        let mut header = CrcReader::new(&mut *r);
+        let mut magic = [0; 8];
+        read_exact(&mut header, &mut magic)?;
+        if magic != MAGIC {
+            return Err(corrupt("unrecognized format"));
+        }
+        let mut tag = [0];
+        read_exact(&mut header, &mut tag)?;
+        let mut count = [0; 8];
+        read_exact(&mut header, &mut count)?;
+        if u64::from_le_bytes(count) != slots as u64 {
+            return Err(corrupt("vector count does not match the slot table"));
+        }
+        let State::Collecting(flat) = &mut backend.state else {
+            unreachable!("a new backend is collecting")
+        };
+        let collecting = tag[0] == 0;
+        // Vectors are read and spilled a chunk at a time: each append maps
+        // the file again, so one per vector would dominate the load.
+        let mut bytes = Vec::new();
+        let mut chunk = Vec::new();
+        for first in (0..slots).step_by(LOAD_CHUNK) {
+            let n = LOAD_CHUNK.min(slots - first);
+            bytes.resize(n * dim * 4, 0);
+            read_exact(&mut header, &mut bytes)?;
+            chunk.clear();
+            chunk.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b)),
+            );
+            backend.vectors.append(chunk.chunks_exact(dim))?;
+            if collecting {
+                for (i, vector) in chunk.chunks_exact(dim).enumerate() {
+                    flat.add((first + i) as PointId, vector)?;
+                }
+            }
+        }
+        let computed = header.crc();
+        let mut stored = [0; 4];
+        read_exact(r, &mut stored)?;
+        if u32::from_le_bytes(stored) != computed {
+            return Err(corrupt("checksum mismatch"));
+        }
+
+        let codes = match tag[0] {
+            0 if slots < config.training_points => return Ok(Some(backend)),
+            1 if config.lists == 0 => Codes::Flat(PqIndex::read_from(r)?),
+            2 if config.lists > 0 => {
+                let mut ivf = IvfPqIndex::read_from(r)?;
+                if ivf.lists() != config.lists {
+                    return Ok(None);
+                }
+                ivf.set_probe(config.probe);
+                Codes::Ivf(ivf)
+            }
+            0..=2 => return Ok(None),
+            _ => return Err(corrupt("unknown state")),
+        };
+        let quantizer = match &codes {
+            Codes::Flat(pq) => pq.quantizer(),
+            Codes::Ivf(ivf) => ivf.quantizer(),
+        };
+        if (quantizer.dim(), quantizer.metric(), quantizer.code_len())
+            != (dim, metric, config.subspaces)
+        {
+            return Ok(None);
+        }
+        let ids: Box<dyn Iterator<Item = PointId>> = match &codes {
+            Codes::Flat(pq) => Box::new(pq.ids()),
+            Codes::Ivf(ivf) => Box::new(ivf.ids()),
+        };
+        if !covers_slots(ids, slots) {
+            return Err(corrupt("codes do not match the slot table"));
+        }
+        backend.state = State::Trained(codes);
+        Ok(Some(backend))
+    }
+}
+
+/// Whether `ids` are exactly `0..slots`, each once, in any order.
+fn covers_slots(ids: impl Iterator<Item = PointId>, slots: usize) -> bool {
+    let mut seen = vec![false; slots];
+    let mut count = 0;
+    for id in ids {
+        let Some(slot) = usize::try_from(id).ok().and_then(|s| seen.get_mut(s)) else {
+            return false;
+        };
+        if std::mem::replace(slot, true) {
+            return false;
+        }
+        count += 1;
+    }
+    count == slots
+}
+
+fn read_exact(r: &mut (impl Read + ?Sized), buf: &mut [u8]) -> Result<()> {
+    r.read_exact(buf).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::corruption("PQ backend", "truncated")
+        } else {
+            Error::Io(err)
+        }
+    })
 }
 
 #[cfg(test)]

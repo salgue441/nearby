@@ -10,7 +10,7 @@
 //! magic "NBSNAP01", generation u64, slot count u64
 //! for each slot: point id u64, live u8
 //! crc32 of the above u32
-//! the index, in its own self-checking format (see Hnsw::write_to)
+//! the index, in its own self-checking format (see `IndexBackend::save`)
 //! ```
 
 use std::fs::File;
@@ -19,10 +19,9 @@ use std::path::{Path, PathBuf};
 
 use nearby_core::checksum::{CrcReader, CrcWriter};
 use nearby_core::{Error, PointId, Result};
-use nearby_index::{Hnsw, VectorIndex};
 
-use crate::backend::IndexBackend;
-use crate::config::{CollectionConfig, IndexConfig};
+use crate::backend::{self, IndexBackend};
+use crate::config::CollectionConfig;
 use crate::points::PointTable;
 
 /// The snapshot's file name inside a collection directory.
@@ -77,7 +76,7 @@ pub(crate) fn load(
     }
     let outcome = File::open(&path)
         .map_err(Error::from)
-        .and_then(|file| read(BufReader::new(file), config, generation));
+        .and_then(|file| read(BufReader::new(file), dir, config, generation));
     match outcome {
         Ok(Some(state)) => return Some(state),
         Ok(None) => {
@@ -103,12 +102,10 @@ pub(crate) fn remove(dir: &Path) {
 /// Reads a snapshot. `Ok(None)` means it is valid but doesn't apply.
 fn read(
     r: impl Read,
+    dir: &Path,
     config: &CollectionConfig,
     generation: u64,
 ) -> Result<Option<(PointTable, Box<dyn IndexBackend>)>> {
-    if !matches!(config.index, IndexConfig::Hnsw(_)) {
-        return Ok(None);
-    }
     let corrupt = |reason: &str| Error::corruption(FILE_NAME, reason);
     let mut header = CrcReader::new(r);
     let mut magic = [0; 8];
@@ -136,19 +133,14 @@ fn read(
         return Err(corrupt("checksum mismatch"));
     }
 
-    let index = Hnsw::read_from(r).map_err(|err| match err {
+    let Some(index) = backend::load(config, dir, &mut r, count).map_err(|err| match err {
         Error::Corruption { reason, .. } => corrupt(&reason),
         other => other,
-    })?;
-    if index.dim() != config.dim || index.metric() != config.metric {
+    })?
+    else {
         return Ok(None);
-    }
-    // The engine indexes slots: node `s` must be slot `s`.
-    if index.len() != count || index.iter().enumerate().any(|(s, (id, _))| id != s as u64) {
-        return Err(corrupt("index does not match the slot table"));
-    }
-    let points = PointTable::from_slots(&slots);
-    Ok(Some((points, Box::new(index))))
+    };
+    Ok(Some((PointTable::from_slots(&slots), index)))
 }
 
 fn read_exact(r: &mut impl Read, buf: &mut [u8]) -> Result<()> {
@@ -181,7 +173,7 @@ mod tests {
 
     use super::*;
     use crate::backend::new_index;
-    use crate::config::HnswConfig;
+    use crate::config::{HnswConfig, IndexConfig, PqConfig};
 
     fn config() -> CollectionConfig {
         CollectionConfig {
@@ -272,5 +264,80 @@ mod tests {
             ..config()
         };
         assert!(load(dir.path(), &cosine, 7).is_none());
+    }
+
+    fn pq_config(lists: usize) -> CollectionConfig {
+        CollectionConfig {
+            dim: 4,
+            metric: Metric::L2,
+            index: IndexConfig::Pq(PqConfig {
+                subspaces: 2,
+                training_points: 300,
+                rerank: 2,
+                lists,
+                probe: 3,
+            }),
+        }
+    }
+
+    /// `n` PQ points with ids `0..n`, the last one deleted.
+    fn pq_state(
+        config: &CollectionConfig,
+        dir: &Path,
+        n: u64,
+    ) -> (PointTable, Box<dyn IndexBackend>) {
+        let mut points = PointTable::new();
+        let mut index = new_index(config, 0, dir).unwrap();
+        let vectors: Vec<[f32; 4]> = (0..n)
+            .map(|i| {
+                let x = (i * 7919 % 1000) as f32;
+                [x, (i % 13) as f32, x / 3.0, (i % 101) as f32]
+            })
+            .collect();
+        let batch: Vec<(PointId, &[f32])> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (u64::from(points.upsert(i as PointId)), &v[..]))
+            .collect();
+        index.insert_batch(&batch, NonZeroUsize::MIN).unwrap();
+        points.delete(n - 1);
+        (points, index)
+    }
+
+    #[test]
+    fn pq_backends_load_back_in_every_state() {
+        // Collecting (too few points to train), codes, and clustered codes.
+        for (lists, n) in [(0, 100), (0, 600), (8, 600)] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = pq_config(lists);
+            let (points, index) = pq_state(&config, dir.path(), n);
+            assert!(save(dir.path(), 3, &points, index.as_ref()).unwrap());
+
+            let (loaded, loaded_index) = load(dir.path(), &config, 3).unwrap();
+            assert_eq!(
+                (loaded.len(), loaded.slot_count()),
+                (points.len(), points.slot_count())
+            );
+            assert_eq!(
+                loaded_index.rerank(),
+                index.rerank(),
+                "lists {lists}, n {n}"
+            );
+            assert_eq!(loaded_index.vector(42), index.vector(42));
+            for q in [[0.0; 4], [500.0, 6.0, 170.0, 50.0]] {
+                assert_eq!(
+                    loaded_index.search(&q, 10).unwrap(),
+                    index.search(&q, 10).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pq_snapshot_with_other_clustering_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let (points, index) = pq_state(&pq_config(8), dir.path(), 600);
+        save(dir.path(), 3, &points, index.as_ref()).unwrap();
+        assert!(load(dir.path(), &pq_config(0), 3).is_none());
     }
 }

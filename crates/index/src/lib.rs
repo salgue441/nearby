@@ -9,6 +9,7 @@
 
 use nearby_core::{PointId, Result, ScoredPoint};
 
+mod codec;
 mod flat;
 mod hnsw;
 mod parallel;

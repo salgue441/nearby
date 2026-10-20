@@ -149,7 +149,7 @@ impl Database {
     }
 
     /// Checkpoints every collection (see [`Collection::checkpoint`]): flushes
-    /// its log and saves HNSW indexes, so the next start is quick.
+    /// its log and saves HNSW and PQ indexes, so the next start is quick.
     ///
     /// # Errors
     ///

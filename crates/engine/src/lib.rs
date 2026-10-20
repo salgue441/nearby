@@ -13,8 +13,8 @@
 //!   vector stays in the index, where searches skip it; once dead vectors
 //!   outnumber live ones, the index is rebuilt without them.
 //! - **Recovery.** Opening a collection replays its storage and rebuilds the
-//!   index, in parallel where the index allows. An HNSW collection saves a
-//!   snapshot on checkpoint, so it only replays the log written since.
+//!   index, in parallel where the index allows. HNSW and PQ collections save
+//!   a snapshot on checkpoint, so they only replay the log written since.
 //! - **Indexes.** Flat (exact), HNSW, or PQ: compressed codes whose
 //!   candidates are re-ranked by exact distance (see [`PqConfig`]).
 

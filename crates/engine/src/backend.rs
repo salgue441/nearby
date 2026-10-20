@@ -1,10 +1,10 @@
 //! The indexes a collection can search with, behind one interface.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-use nearby_core::{PointId, Result};
+use nearby_core::{Error, PointId, Result};
 use nearby_index::{FlatIndex, Hnsw, VectorIndex};
 
 use crate::config::{CollectionConfig, IndexConfig};
@@ -99,6 +99,46 @@ pub(crate) fn new_index(
         )?),
         IndexConfig::Pq(pq) => Box::new(PqBackend::new(config.dim, config.metric, pq, dir)?),
     })
+}
+
+/// Restores an index that [`IndexBackend::save`] wrote for a collection set
+/// up as `config`, spilling to `dir` where the index does. The index must
+/// hold exactly `slots` points, point `s` in slot `s`.
+///
+/// `Ok(None)` means the saved index doesn't apply: it was saved with other
+/// settings, or `config` names an index that is never saved.
+///
+/// # Errors
+///
+/// [`nearby_core::Error::Corruption`] if the data is damaged or doesn't
+/// match `slots`, or an I/O error.
+pub(crate) fn load(
+    config: &CollectionConfig,
+    dir: &Path,
+    r: &mut dyn Read,
+    slots: usize,
+) -> Result<Option<Box<dyn IndexBackend>>> {
+    match &config.index {
+        IndexConfig::Flat => Ok(None),
+        IndexConfig::Hnsw(_) => {
+            let index = Hnsw::read_from(r)?;
+            if index.dim() != config.dim || index.metric() != config.metric {
+                return Ok(None);
+            }
+            // The engine indexes slots: node `s` must be slot `s`.
+            if index.len() != slots || index.iter().enumerate().any(|(s, (id, _))| id != s as u64) {
+                return Err(Error::corruption(
+                    "HNSW index",
+                    "index does not match the slot table",
+                ));
+            }
+            Ok(Some(Box::new(index)))
+        }
+        IndexConfig::Pq(pq) => {
+            let backend = PqBackend::load(config.dim, config.metric, pq, dir, r, slots)?;
+            Ok(backend.map(|b| Box::new(b) as Box<dyn IndexBackend>))
+        }
+    }
 }
 
 #[cfg(test)]
