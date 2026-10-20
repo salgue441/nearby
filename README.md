@@ -547,6 +547,7 @@ requests and flushes every collection before exiting.
 | `POST` | `/collections/{name}/points/delete` | `{"ids": [1, 2]}` | `{"deleted": 2}` |
 | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
 | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.12, "payload": {...}}]}` |
+| `POST` | `/collections/{name}/search/batch` | `{"searches": [search, ...]}`, up to 1,024 | `{"results": [[...], ...]}`, one list per search, in order |
 
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
   `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
@@ -572,6 +573,9 @@ requests and flushes every collection before exiting.
   for a missing collection or point, `409` for a name that's taken, `413`
   for a body over `max_body_bytes`, `422` for JSON of the wrong shape.
 - `k` defaults to 10 and is at most 10,000. Ties come back in write order.
+- **Batch searches** run in parallel under one read lock and save a round
+  trip per query. An error in any search fails the batch, naming it:
+  `search 3: dimension mismatch ...`.
 
 - **Authentication.** Set `api_key` under `[server]`, or the `NEARBY_API_KEY`
   environment variable, and every endpoint but `/health` requires
