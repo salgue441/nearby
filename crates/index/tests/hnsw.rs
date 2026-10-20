@@ -3,6 +3,7 @@
 //! Recall against exact search is covered in `recall.rs`; this file covers
 //! the API contract: errors, edge cases, determinism and thread safety.
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use nearby_core::{Error, Metric, PointId, ScoredPoint};
@@ -206,5 +207,63 @@ fn usable_as_a_shared_trait_object() {
         .collect();
     for handle in handles {
         handle.join().unwrap();
+    }
+}
+
+/// `data` as `insert_batch` input, with each vector's position as its id.
+fn batch(data: &[Vec<f32>]) -> Vec<(PointId, &[f32])> {
+    data.iter()
+        .enumerate()
+        .map(|(i, v)| (i as PointId, v.as_slice()))
+        .collect()
+}
+
+fn threads(n: usize) -> NonZeroUsize {
+    NonZeroUsize::new(n).unwrap()
+}
+
+#[test]
+fn batch_insert_rejects_any_bad_vector_and_inserts_nothing() {
+    let mut index = build(
+        Metric::L2,
+        HnswParams::default(),
+        &random_vectors(50, DIM, 15),
+    );
+    let mut data = random_vectors(100, DIM, 16);
+
+    data[70][3] = f32::NAN;
+    assert!(matches!(
+        index.insert_batch(&batch(&data), threads(4)),
+        Err(Error::InvalidVector)
+    ));
+    data[70] = vec![0.0; DIM - 1];
+    assert!(matches!(
+        index.insert_batch(&batch(&data), threads(4)),
+        Err(Error::DimensionMismatch { .. })
+    ));
+    assert_eq!(index.len(), 50, "a rejected batch stores nothing");
+}
+
+#[test]
+fn empty_batch_is_a_no_op() {
+    let mut index = Hnsw::new(DIM, Metric::L2, HnswParams::default()).unwrap();
+    index.insert_batch(&[], threads(4)).unwrap();
+    assert!(index.is_empty());
+    assert_eq!(index.search(&[0.0; DIM], 3).unwrap(), Vec::new());
+}
+
+#[test]
+fn batch_and_single_inserts_can_mix() {
+    let data = random_vectors(1_500, DIM, 17);
+    let mut index = Hnsw::new(DIM, Metric::Cosine, HnswParams::default()).unwrap();
+    let all = batch(&data);
+    index.insert(0, &data[0]).unwrap();
+    index.insert_batch(&all[1..700], threads(3)).unwrap();
+    index.insert(700, &data[700]).unwrap();
+    index.insert_batch(&all[701..], threads(8)).unwrap();
+
+    assert_eq!(index.len(), data.len());
+    for (i, v) in data.iter().enumerate().step_by(7) {
+        assert_eq!(index.search(v, 1).unwrap()[0].id, i as PointId);
     }
 }
