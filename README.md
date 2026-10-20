@@ -29,6 +29,9 @@ benchmark harness that keeps every optimization honest.
 - **Memory-aware HNSW.** Neighbor vectors are prefetched before they are
   measured, visited sets are pooled and reset in O(1), and searches take
   `&self`, so many threads can query one index at once.
+- **Parallel, deterministic builds.** `insert_batch` links vectors on every
+  core (3.6× faster on SIFT1M with 16 threads) and builds the same graph
+  whatever the thread count.
 - **Reproducible by design.** Seeded graph construction, deterministic tie
   breaking, and identical results across runs on a given machine.
 - **Measured, not guessed.** Every optimization in the history comes with
@@ -93,7 +96,12 @@ Tiger Lake laptop (`cargo run -p nearby-bench --release`, default target):
 | `Hnsw`, `ef_search = 160` | 0.9920 | 181 µs | 5,527 |
 | `Hnsw`, `ef_search = 320` | 0.9945 | 266 µs | 3,760 |
 
-Building the HNSW index (`m = 16`, `ef_construction = 200`) takes 25 s.
+Building the HNSW index (`m = 16`, `ef_construction = 200`) one vector at a
+time takes 25 s.
+
+On SIFT1M (1M real 128-d descriptors, same machine and parameters),
+`insert_batch` cuts the build from 367 s to 101 s with 16 threads, at the
+same recall (0.9932 at `ef_search = 160`).
 
 > [!NOTE]
 > These are synthetic vectors, so treat them as indicative. Recall depends
@@ -187,6 +195,13 @@ layer whenever it can't get closer, and finishes with a wider search on layer
 - **Allocation-free visited sets.** Searches borrow a set from a pool, and a
   generation counter clears it in O(1).
 - **Reproducible builds.** Layers come from a seeded `SplitMix64`.
+- **Parallel builds.** `insert_batch` links vectors in chunks of up to 256.
+  Every vector in a chunk searches the graph as it was before the chunk, all
+  in parallel, and is compared directly with the chunk's earlier vectors,
+  which that graph can't reach yet. Back-link pruning is independent per
+  neighbor list, so it runs in parallel too. Chunk sizes depend only on the
+  graph size, so the graph is the same for any thread count (though not the
+  one inserting vectors one at a time builds), and recall matches.
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -267,6 +282,7 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 | `--k N` | `10` | Neighbors per query. At most the ground truth's width (100 for TEXMEX). |
 | `--m N` | `16` | HNSW links per node (`m0` is set to `2 * m`). |
 | `--ef-construction N` | `200` | HNSW candidates per insert. |
+| `--threads N` | all available | Threads that build the HNSW index (`insert_batch`). The graph is the same for any value. |
 | `--ef N,N,...` | `10,20,40,80,160,320` | HNSW `ef_search` values, one result row each. Values below `k` run as `k`, and each row is labeled with the `ef` it actually used. |
 | `-h`, `--help` | | Print usage. |
 
@@ -283,7 +299,7 @@ cargo run -p nearby-bench --release -- data/gist --index hnsw --m 32
 dataset  siftsmall: 10000 base vectors, 100 queries, dim 128
 
 build    flat: ...
-build    hnsw (m=16, ef_construction=200): ..., ... layers
+build    hnsw (m=16, ef_construction=200, threads=16): ..., ... layers
 
 index          recall@10       qps       mean        p50        p95        p99        max
 flat              1.0000       ...        ...        ...        ...        ...        ...
@@ -362,7 +378,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 - [x] HNSW approximate search
 - [x] SIMD distance kernels (AVX2 + FMA, runtime dispatch)
 - [x] Benchmark harness with recall, latency percentiles and `ef` sweeps
-- [ ] Parallel HNSW construction
+- [x] Parallel HNSW construction
 - [ ] Product quantization
 - [ ] Engine: collections, id map, deduplication and deletes
 - [ ] Storage: segments, write-ahead log and recovery
