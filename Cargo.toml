@@ -18,6 +18,7 @@ nearby-engine  = { path = "crates/engine" }
 anyhow = "1"
 axum = { version = "0.8", features = ["macros"] }
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 http-body-util = "0.1"
 memmap2 = "0.9"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
