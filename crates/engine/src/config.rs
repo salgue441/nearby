@@ -148,6 +148,25 @@ enum MetricDef {
 }
 
 impl CollectionConfig {
+    /// Checks that a collection can be built with these settings.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidParameter`] if `dim` is 0 or the index settings are
+    /// invalid for it.
+    pub fn validate(&self) -> Result<()> {
+        if self.dim == 0 {
+            return Err(Error::InvalidParameter(
+                "dimension must be at least 1".to_owned(),
+            ));
+        }
+        match &self.index {
+            IndexConfig::Flat => Ok(()),
+            IndexConfig::Hnsw(hnsw) => hnsw.params().validate(),
+            IndexConfig::Pq(pq) => pq.validate(self.dim),
+        }
+    }
+
     /// Reads the config saved in a collection's directory.
     pub(crate) fn read(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;

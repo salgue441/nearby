@@ -2,6 +2,7 @@
 
 use std::io::Write;
 use std::num::NonZeroUsize;
+use std::path::Path;
 
 use nearby_core::{PointId, Result};
 use nearby_index::{FlatIndex, Hnsw, VectorIndex};
@@ -17,6 +18,13 @@ use crate::pq::PqBackend;
 pub(crate) trait IndexBackend: VectorIndex + std::fmt::Debug {
     /// Appends `points`, using up to `threads` threads where the index can.
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()>;
+
+    /// The vector in `slot`.
+    ///
+    /// # Panics
+    ///
+    /// If `slot` is out of range.
+    fn vector(&self, slot: u32) -> &[f32];
 
     /// If the index's distances are approximate: how many candidates to
     /// fetch per requested result, to be re-ranked by exact distance.
@@ -46,11 +54,19 @@ impl IndexBackend for FlatIndex {
             .iter()
             .try_for_each(|&(id, vector)| self.add(id, vector))
     }
+
+    fn vector(&self, slot: u32) -> &[f32] {
+        self.vector_at(slot as usize).expect("slot in range")
+    }
 }
 
 impl IndexBackend for Hnsw {
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()> {
         Hnsw::insert_batch(self, points, threads)
+    }
+
+    fn vector(&self, slot: u32) -> &[f32] {
+        self.vector_at(slot as usize).expect("slot in range")
     }
 
     fn can_save(&self) -> bool {
@@ -63,9 +79,11 @@ impl IndexBackend for Hnsw {
 }
 
 /// An empty index as `config` describes, with room for `capacity` points.
+/// An index that spills to disk does so in `dir`.
 pub(crate) fn new_index(
     config: &CollectionConfig,
     capacity: usize,
+    dir: &Path,
 ) -> Result<Box<dyn IndexBackend>> {
     Ok(match &config.index {
         IndexConfig::Flat => Box::new(FlatIndex::with_capacity(
@@ -79,7 +97,7 @@ pub(crate) fn new_index(
             hnsw.params(),
             capacity,
         )?),
-        IndexConfig::Pq(pq) => Box::new(PqBackend::new(config.dim, config.metric, pq)?),
+        IndexConfig::Pq(pq) => Box::new(PqBackend::new(config.dim, config.metric, pq, dir)?),
     })
 }
 
@@ -88,22 +106,32 @@ mod tests {
     use nearby_core::Metric;
 
     use super::*;
-    use crate::config::HnswConfig;
+    use crate::config::{HnswConfig, PqConfig};
 
     #[test]
-    fn every_backend_inserts_and_searches() {
-        for index in [IndexConfig::Flat, IndexConfig::Hnsw(HnswConfig::default())] {
+    fn every_backend_inserts_searches_and_lends_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 2,
+            ..PqConfig::default()
+        });
+        for index in [
+            IndexConfig::Flat,
+            IndexConfig::Hnsw(HnswConfig::default()),
+            pq,
+        ] {
             let config = CollectionConfig {
                 dim: 2,
                 metric: Metric::L2,
                 index,
             };
-            let mut backend = new_index(&config, 0).unwrap();
+            let mut backend = new_index(&config, 0, dir.path()).unwrap();
             backend
                 .insert_batch(&[(0, &[0.0, 0.0]), (1, &[5.0, 5.0])], NonZeroUsize::MIN)
                 .unwrap();
             assert_eq!(backend.len(), 2);
             assert_eq!(backend.search(&[4.0, 4.0], 1).unwrap()[0].id, 1);
+            assert_eq!(backend.vector(1), &[5.0, 5.0]);
         }
     }
 
@@ -117,6 +145,6 @@ mod tests {
                 ..HnswConfig::default()
             }),
         };
-        assert!(new_index(&config, 0).is_err());
+        assert!(new_index(&config, 0, Path::new(".")).is_err());
     }
 }

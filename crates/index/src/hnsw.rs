@@ -148,6 +148,11 @@ impl Hnsw {
         self.max_level
     }
 
+    /// The `position`-th vector inserted, counting from 0.
+    pub fn vector_at(&self, position: usize) -> Option<&[f32]> {
+        (position < self.ids.len()).then(|| self.store.get(position))
+    }
+
     /// Every point as `(id, vector)`, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (PointId, &[f32])> {
         self.ids
@@ -622,6 +627,8 @@ mod tests {
         assert_eq!(points.len(), 100);
         assert_eq!(points[0], (0, vec![0.0, 0.0]));
         assert_eq!(points[23], (23, vec![3.0, 2.0]));
+        assert_eq!(index.vector_at(23), Some(&[3.0, 2.0][..]));
+        assert_eq!(index.vector_at(100), None);
     }
 
     #[test]
