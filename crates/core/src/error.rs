@@ -36,6 +36,10 @@ pub enum Error {
     #[error("collection `{0}` not found")]
     CollectionNotFound(String),
 
+    /// A collection with this name already exists.
+    #[error("collection `{0}` already exists")]
+    CollectionExists(String),
+
     /// A constructor or setting got a value it can't work with
     /// (e.g. HNSW `m = 1`).
     #[error("invalid parameter: {0}")]
@@ -141,5 +145,9 @@ mod tests {
     fn error_messages_are_readable() {
         let err = Error::corruption("seg-0001.seg", "bad magic");
         assert_eq!(err.to_string(), "corrupted data in seg-0001.seg: bad magic");
+        assert_eq!(
+            Error::CollectionExists("docs".to_owned()).to_string(),
+            "collection `docs` already exists"
+        );
     }
 }
