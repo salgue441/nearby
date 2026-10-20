@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use nearby_core::{Error, Result};
 
 use crate::manifest::{self, Manifest};
+use crate::merge;
 use crate::segment::{self, Changes};
 use crate::wal::{self, Durability, Op, Wal};
 
@@ -240,7 +241,8 @@ impl CollectionStore {
     /// Flushes the log, then merges every segment into one that holds only
     /// the live points. Does nothing more if there is at most one segment.
     ///
-    /// This reads every point into memory while it runs.
+    /// The merge streams through the segments in id order, so its memory use
+    /// doesn't grow with the collection.
     ///
     /// # Errors
     ///
@@ -250,15 +252,15 @@ impl CollectionStore {
         if self.manifest.segments.len() <= 1 {
             return Ok(());
         }
-        let mut changes = Changes::default();
-        for name in &self.manifest.segments {
-            segment::read(&self.dir.join(name), self.dim(), |op| changes.apply(op))?;
-        }
-        changes.drop_deletes();
-
+        let inputs: Vec<PathBuf> = self
+            .manifest
+            .segments
+            .iter()
+            .map(|name| self.dir.join(name))
+            .collect();
         let mut manifest = self.manifest.clone();
         let segment = manifest.new_segment_name();
-        changes.write(&self.dir.join(&segment), self.dim())?;
+        merge::merge(&inputs, self.dim(), &self.dir.join(&segment))?;
         manifest.segments = vec![segment];
         self.commit(manifest)
     }
