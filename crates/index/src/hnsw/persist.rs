@@ -21,19 +21,15 @@
 use std::io::{Read, Write};
 use std::sync::Mutex;
 
-use nearby_core::checksum::{CrcReader, CrcWriter};
-use nearby_core::{Error, Metric, PointId, Result};
+use nearby_core::{Metric, Result};
 
 use super::graph::Graph;
 use super::{Hnsw, HnswParams, MAX_LEVEL};
+use crate::codec::{Decoder, Encoder};
 use crate::rng::SplitMix64;
 use crate::store::VectorStore;
 
-const MAGIC: &[u8; 8] = b"NBHNSW01";
-
-/// Values converted per read when loading large arrays, bounding the
-/// temporary byte buffer.
-const READ_CHUNK: usize = 1 << 16;
+const MAGIC: [u8; 8] = *b"NBHNSW01";
 
 impl Hnsw {
     /// Writes the whole index, graph and vectors, to `w`, so
@@ -45,50 +41,43 @@ impl Hnsw {
     ///
     /// If writing fails.
     pub fn write_to(&self, w: impl Write) -> Result<()> {
-        let mut w = CrcWriter::new(w);
+        let mut e = Encoder::new(w);
         let params = &self.params;
-        w.write_all(MAGIC)?;
-        write_u32(&mut w, self.store.dim())?;
-        w.write_all(&[metric_tag(self.metric)])?;
+        e.bytes(&MAGIC)?;
+        e.u32(self.store.dim())?;
+        e.metric(self.metric)?;
         for value in [
             params.m,
             params.m0,
             params.ef_construction,
             params.ef_search,
         ] {
-            write_u32(&mut w, value)?;
+            e.u32(value)?;
         }
-        w.write_all(&params.seed.to_le_bytes())?;
-        w.write_all(&self.rng.state().to_le_bytes())?;
-        w.write_all(&(self.ids.len() as u64).to_le_bytes())?;
-        let entry = self.entry_point.map_or(u64::MAX, u64::from);
-        w.write_all(&entry.to_le_bytes())?;
-        write_u32(&mut w, self.max_level)?;
+        e.u64(params.seed)?;
+        e.u64(self.rng.state())?;
+        e.u64(self.ids.len() as u64)?;
+        e.u64(self.entry_point.map_or(u64::MAX, u64::from))?;
+        e.u32(self.max_level)?;
 
-        write_f32s(&mut w, self.store.as_slice())?;
-        write_f32s(&mut w, &self.norms)?;
-        for id in &self.ids {
-            w.write_all(&id.to_le_bytes())?;
-        }
+        e.f32s(self.store.as_slice())?;
+        e.f32s(&self.norms)?;
+        e.u64s(&self.ids)?;
         let count = self.ids.len() as u32;
         // Levels never exceed MAX_LEVEL (16), so each fits in a byte.
         let levels: Vec<u8> = (0..count).map(|n| self.graph.level(n) as u8).collect();
-        w.write_all(&levels)?;
+        e.bytes(&levels)?;
         for node in 0..count {
             for level in 0..=self.graph.level(node) {
                 let links = self.graph.neighbors(node, level);
                 // Lists hold at most m0 <= 1024 links.
-                w.write_all(&(links.len() as u16).to_le_bytes())?;
+                e.bytes(&(links.len() as u16).to_le_bytes())?;
                 for link in links {
-                    w.write_all(&link.to_le_bytes())?;
+                    e.bytes(&link.to_le_bytes())?;
                 }
             }
         }
-        let crc = w.crc();
-        let mut w = w.into_inner();
-        w.write_all(&crc.to_le_bytes())?;
-        w.flush()?;
-        Ok(())
+        e.finish()
     }
 
     /// Restores an index written by [`Hnsw::write_to`].
@@ -99,64 +88,52 @@ impl Hnsw {
     ///
     /// [`Error::Corruption`] if the data is truncated, fails its checksum or
     /// describes an invalid graph; an I/O error if reading fails.
+    ///
+    /// [`Error::Corruption`]: nearby_core::Error::Corruption
     pub fn read_from(r: impl Read) -> Result<Self> {
-        let mut r = CrcReader::new(r);
-        if &read_array::<8>(&mut r)? != MAGIC {
-            return Err(corrupt("not an HNSW index"));
-        }
-        let dim = read_u32(&mut r)? as usize;
-        let metric = metric_from_tag(read_array::<1>(&mut r)?[0])?;
+        let mut d = Decoder::new(r, "HNSW index");
+        d.magic(MAGIC)?;
+        let dim = d.u32()?;
+        let metric = d.metric()?;
         let params = HnswParams {
-            m: read_u32(&mut r)? as usize,
-            m0: read_u32(&mut r)? as usize,
-            ef_construction: read_u32(&mut r)? as usize,
-            ef_search: read_u32(&mut r)? as usize,
-            seed: read_u64(&mut r)?,
+            m: d.u32()?,
+            m0: d.u32()?,
+            ef_construction: d.u32()?,
+            ef_search: d.u32()?,
+            seed: d.u64()?,
         };
-        params.validate().map_err(|e| corrupt(&e.to_string()))?;
+        params.validate().map_err(|e| d.corrupt(&e.to_string()))?;
         if dim == 0 {
-            return Err(corrupt("dimension is 0"));
+            return Err(d.corrupt("dimension is 0"));
         }
-        let rng = SplitMix64::new(read_u64(&mut r)?);
-        let count = read_u64(&mut r)?;
+        let rng = SplitMix64::new(d.u64()?);
+        let count = d.u64()?;
         if count > 1 << 32 {
-            return Err(corrupt("more than 2^32 nodes"));
+            return Err(d.corrupt("more than 2^32 nodes"));
         }
         let count = count as usize;
-        let entry = read_u64(&mut r)?;
-        let max_level = read_u32(&mut r)? as usize;
+        let entry = d.u64()?;
+        let max_level = d.u32()?;
 
-        let vectors = read_f32s(
-            &mut r,
-            count
-                .checked_mul(dim)
-                .ok_or_else(|| corrupt("size overflow"))?,
-        )?;
-        let norms = read_f32s(&mut r, if metric == Metric::Cosine { count } else { 0 })?;
-        let mut ids: Vec<PointId> = try_vec(count)?;
-        for _ in 0..count {
-            ids.push(read_u64(&mut r)?);
-        }
-        let mut levels = vec![0u8; count];
-        r.read_exact(&mut levels).map_err(truncated)?;
-        let graph = read_graph(&mut r, &params, &levels)?;
-
-        let computed = r.crc();
-        let stored = u32::from_le_bytes(read_array::<4>(&mut r.into_inner())?);
-        if computed != stored {
-            return Err(corrupt("checksum mismatch"));
-        }
-
+        let size = count
+            .checked_mul(dim)
+            .ok_or_else(|| d.corrupt("size overflow"))?;
+        let vectors = d.f32s(size)?;
+        let norms = d.f32s(if metric == Metric::Cosine { count } else { 0 })?;
+        let ids = d.u64s(count)?;
+        let levels = d.bytes(count)?;
+        let graph = read_graph(&mut d, &params, &levels)?;
         let entry_point = match (count, entry) {
             (0, u64::MAX) => None,
-            (0, _) => return Err(corrupt("an empty index has an entry point")),
+            (0, _) => return Err(d.corrupt("an empty index has an entry point")),
             (_, e) if e < count as u64 => Some(e as u32),
-            _ => return Err(corrupt("entry point out of range")),
+            _ => return Err(d.corrupt("entry point out of range")),
         };
         let top = levels.iter().copied().max().map_or(0, usize::from);
         if max_level != top || entry_point.is_some_and(|e| graph.level(e) != top) {
-            return Err(corrupt("entry point is not on the top layer"));
+            return Err(d.corrupt("entry point is not on the top layer"));
         }
+        d.finish()?;
 
         Ok(Self {
             params,
@@ -174,28 +151,28 @@ impl Hnsw {
 }
 
 /// Reads every node's links, checking each list's length and targets.
-fn read_graph(r: &mut impl Read, params: &HnswParams, levels: &[u8]) -> Result<Graph> {
+fn read_graph(d: &mut Decoder<impl Read>, params: &HnswParams, levels: &[u8]) -> Result<Graph> {
     let count = levels.len();
     let mut graph = Graph::with_capacity(params.m0, count);
     for &level in levels {
         let level = usize::from(level);
         if level > MAX_LEVEL {
-            return Err(corrupt("node level above the maximum"));
+            return Err(d.corrupt("node level above the maximum"));
         }
         graph.add_node(level);
     }
     let mut links = Vec::new();
     for node in 0..count as u32 {
         for level in 0..=graph.level(node) {
-            let len = usize::from(u16::from_le_bytes(read_array::<2>(r)?));
+            let len = usize::from(u16::from_le_bytes(d.array()?));
             if len > params.max_links(level) {
-                return Err(corrupt("neighbor list longer than allowed"));
+                return Err(d.corrupt("neighbor list longer than allowed"));
             }
             links.clear();
             for _ in 0..len {
-                let link = read_u32(r)?;
+                let link = u32::from_le_bytes(d.array()?);
                 if link as usize >= count || usize::from(levels[link as usize]) < level {
-                    return Err(corrupt("link to a node not on that layer"));
+                    return Err(d.corrupt("link to a node not on that layer"));
                 }
                 links.push(link);
             }
@@ -205,99 +182,11 @@ fn read_graph(r: &mut impl Read, params: &HnswParams, levels: &[u8]) -> Result<G
     Ok(graph)
 }
 
-fn metric_tag(metric: Metric) -> u8 {
-    match metric {
-        Metric::L2 => 0,
-        Metric::Cosine => 1,
-        Metric::Dot => 2,
-    }
-}
-
-fn metric_from_tag(tag: u8) -> Result<Metric> {
-    match tag {
-        0 => Ok(Metric::L2),
-        1 => Ok(Metric::Cosine),
-        2 => Ok(Metric::Dot),
-        _ => Err(corrupt("unknown metric")),
-    }
-}
-
-fn corrupt(reason: &str) -> Error {
-    Error::corruption("HNSW index", reason)
-}
-
-/// A read that ran out of data means the file was cut short; other I/O
-/// errors stay I/O errors.
-fn truncated(err: std::io::Error) -> Error {
-    if err.kind() == std::io::ErrorKind::UnexpectedEof {
-        corrupt("truncated")
-    } else {
-        Error::Io(err)
-    }
-}
-
-/// An empty `Vec` with room for `n` items, or a corruption error if `n`
-/// is too large to allocate (a damaged length field must not abort).
-fn try_vec<T>(n: usize) -> Result<Vec<T>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(n)
-        .map_err(|_| corrupt("length too large to allocate"))?;
-    Ok(v)
-}
-
-fn write_u32(w: &mut impl Write, value: usize) -> Result<()> {
-    let value = u32::try_from(value).expect("index sizes fit in u32");
-    w.write_all(&value.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_f32s(w: &mut impl Write, values: &[f32]) -> Result<()> {
-    let mut buf = Vec::with_capacity(READ_CHUNK.min(values.len()) * 4);
-    for chunk in values.chunks(READ_CHUNK) {
-        buf.clear();
-        for value in chunk {
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
-        w.write_all(&buf)?;
-    }
-    Ok(())
-}
-
-fn read_array<const N: usize>(r: &mut impl Read) -> Result<[u8; N]> {
-    let mut buf = [0; N];
-    r.read_exact(&mut buf).map_err(truncated)?;
-    Ok(buf)
-}
-
-fn read_u32(r: &mut impl Read) -> Result<u32> {
-    read_array(r).map(u32::from_le_bytes)
-}
-
-fn read_u64(r: &mut impl Read) -> Result<u64> {
-    read_array(r).map(u64::from_le_bytes)
-}
-
-fn read_f32s(r: &mut impl Read, n: usize) -> Result<Vec<f32>> {
-    let mut values = try_vec(n)?;
-    let mut buf = vec![0u8; READ_CHUNK.min(n) * 4];
-    while values.len() < n {
-        let take = (n - values.len()).min(READ_CHUNK);
-        let bytes = &mut buf[..take * 4];
-        r.read_exact(bytes).map_err(truncated)?;
-        values.extend(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes(*b)),
-        );
-    }
-    Ok(values)
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
+
+    use nearby_core::{Error, PointId};
 
     use super::*;
     use crate::VectorIndex;
@@ -376,7 +265,7 @@ mod tests {
             (&good[..good.len() - 1], "truncated"),
             (&good[..10], "truncated"),
             (&flipped, ""),
-            (&bad_magic, "not an HNSW index"),
+            (&bad_magic, "unrecognized format"),
         ];
         for (data, expected) in cases {
             let err = Hnsw::read_from(data).unwrap_err();
