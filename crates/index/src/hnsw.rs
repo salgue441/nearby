@@ -11,7 +11,6 @@
 mod graph;
 mod insert;
 mod params;
-mod rng;
 mod search;
 mod visited;
 
@@ -23,10 +22,10 @@ use nearby_core::{Error, Metric, PointId, Result, ScoredPoint, validate_vector};
 
 use self::graph::Graph;
 pub use self::params::HnswParams;
-use self::rng::SplitMix64;
 use self::search::SearchCtx;
 use self::visited::VisitedSet;
 use crate::VectorIndex;
+use crate::rng::SplitMix64;
 use crate::store::VectorStore;
 
 /// Highest layer a node can be assigned. With m = 16, reaching it naturally

@@ -13,6 +13,7 @@ use nearby_core::{Result, ScoredPoint};
 mod flat;
 mod hnsw;
 mod parallel;
+mod rng;
 mod store;
 
 pub use flat::FlatIndex;
