@@ -194,6 +194,7 @@ mod tests {
             .write(&[Op::Upsert {
                 id: 1,
                 vector: &[1.0],
+                payload: &[],
             }])
             .unwrap();
         store.flush().unwrap();

@@ -6,8 +6,9 @@
 //! ┌─────────────┬────────────┬──────────────────────────────────────────┐
 //! │ len: u32    │ crc32: u32 │ payload (len bytes)                      │
 //! └─────────────┴────────────┴──────────────────────────────────────────┘
-//! payload: tag u8 (1 = upsert, 2 = delete), id u64,
-//!          and for an upsert: value count u32, then the f32 values
+//! payload: tag u8 (1 = upsert, 2 = delete, 3 = upsert with a payload), id u64,
+//!          for an upsert: value count u32, then the f32 values,
+//!          and for tag 3: payload length u32, then the payload bytes
 //! ```
 //!
 //! A crash can cut the last record short. When a log is opened, replay stops
@@ -26,6 +27,9 @@ use nearby_core::checksum::crc32;
 
 const TAG_UPSERT: u8 = 1;
 const TAG_DELETE: u8 = 2;
+/// An upsert with a non-empty payload. Upserts without one keep tag 1, so
+/// their records are the same as before payloads existed.
+const TAG_UPSERT_PAYLOAD: u8 = 3;
 
 /// Bytes before each record's payload: its length and checksum.
 const HEADER_LEN: usize = 8;
@@ -39,6 +43,9 @@ pub enum Op<'a> {
         id: PointId,
         /// Its vector.
         vector: &'a [f32],
+        /// Bytes stored with the point, empty for none. Storage doesn't
+        /// interpret them.
+        payload: &'a [u8],
     },
     /// Removes the point, if it exists.
     Delete {
@@ -159,11 +166,23 @@ impl Wal {
 fn encode(op: &Op<'_>, buf: &mut Vec<u8>) {
     let mut payload = Vec::new();
     match *op {
-        Op::Upsert { id, vector } => {
-            payload.put_u8(TAG_UPSERT);
+        Op::Upsert {
+            id,
+            vector,
+            payload: bytes,
+        } => {
+            payload.put_u8(if bytes.is_empty() {
+                TAG_UPSERT
+            } else {
+                TAG_UPSERT_PAYLOAD
+            });
             payload.put_u64(id);
             payload.put_u32(u32::try_from(vector.len()).expect("vector length fits in u32"));
             payload.put_f32s(vector);
+            if !bytes.is_empty() {
+                payload.put_u32(u32::try_from(bytes.len()).expect("payload length fits in u32"));
+                payload.extend_from_slice(bytes);
+            }
         }
         Op::Delete { id } => {
             payload.put_u8(TAG_DELETE);
@@ -207,17 +226,27 @@ fn next_payload<'a>(reader: &mut Reader<'a>) -> Option<&'a [u8]> {
 
 /// Decodes a payload whose checksum matched. `vector` must have the
 /// collection's dimension; an upsert of any other length is rejected.
-fn decode<'v>(payload: &[u8], vector: &'v mut [f32]) -> Option<Op<'v>> {
+fn decode<'v>(payload: &'v [u8], vector: &'v mut [f32]) -> Option<Op<'v>> {
     let mut r = Reader::new(payload);
     let tag = r.u8()?;
     let id = r.u64()?;
     let op = match tag {
-        TAG_UPSERT => {
+        TAG_UPSERT | TAG_UPSERT_PAYLOAD => {
             if r.u32()? as usize != vector.len() {
                 return None;
             }
             r.f32s_into(vector)?;
-            Op::Upsert { id, vector }
+            let payload = if tag == TAG_UPSERT_PAYLOAD {
+                let len = r.u32()? as usize;
+                r.take(len)?
+            } else {
+                &[]
+            };
+            Op::Upsert {
+                id,
+                vector,
+                payload,
+            }
         }
         TAG_DELETE => Op::Delete { id },
         _ => return None,
@@ -257,7 +286,7 @@ mod tests {
 
     fn owned(op: Op<'_>) -> Owned {
         match op {
-            Op::Upsert { id, vector } => Owned::Upsert(id, vector.to_vec()),
+            Op::Upsert { id, vector, .. } => Owned::Upsert(id, vector.to_vec()),
             Op::Delete { id } => Owned::Delete(id),
         }
     }
@@ -277,6 +306,7 @@ mod tests {
             Op::Upsert {
                 id: 1,
                 vector: &[1.0, 2.0],
+                payload: &[],
             },
             Op::Delete { id: 9 },
         ])
@@ -284,6 +314,7 @@ mod tests {
         wal.append(&[Op::Upsert {
             id: 1,
             vector: &[3.0, 4.0],
+            payload: &[],
         }])
         .unwrap();
         drop(wal);
@@ -353,11 +384,66 @@ mod tests {
         wal.append(&[Op::Upsert {
             id: 1,
             vector: &[1.0, 2.0, 3.0],
+            payload: &[],
         }])
         .unwrap();
         drop(wal);
         let (_, seen) = reopen(&path);
         assert_eq!(seen, Vec::new(), "a 3-d vector in a 2-d log is corruption");
+    }
+
+    #[test]
+    fn payloads_replay_with_their_upserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut wal = Wal::create(&path, Durability::Sync).unwrap();
+        wal.append(&[
+            Op::Upsert {
+                id: 1,
+                vector: &[1.0, 2.0],
+                payload: b"tagged",
+            },
+            Op::Upsert {
+                id: 2,
+                vector: &[3.0, 4.0],
+                payload: &[],
+            },
+        ])
+        .unwrap();
+        drop(wal);
+        let mut payloads = Vec::new();
+        Wal::read(&path, 2, |op| {
+            if let Op::Upsert { id, payload, .. } = op {
+                payloads.push((id, payload.to_vec()));
+            }
+        })
+        .unwrap();
+        assert_eq!(payloads, vec![(1, b"tagged".to_vec()), (2, Vec::new())]);
+    }
+
+    #[test]
+    fn upserts_without_a_payload_keep_the_original_record() {
+        let mut with = Vec::new();
+        encode(
+            &Op::Upsert {
+                id: 1,
+                vector: &[1.0],
+                payload: b"x",
+            },
+            &mut with,
+        );
+        let mut without = Vec::new();
+        encode(
+            &Op::Upsert {
+                id: 1,
+                vector: &[1.0],
+                payload: &[],
+            },
+            &mut without,
+        );
+        // Each record starts with its length and checksum; the tag follows.
+        assert_eq!((with[8], without[8]), (TAG_UPSERT_PAYLOAD, TAG_UPSERT));
+        assert_eq!(without.len(), 8 + 1 + 8 + 4 + 4, "no payload fields");
     }
 
     #[test]
@@ -367,6 +453,7 @@ mod tests {
             Op::Upsert {
                 id: 2,
                 vector: &[1.0],
+                payload: &[],
             },
         ];
         assert!(matches!(

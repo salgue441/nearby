@@ -102,7 +102,7 @@ impl Collection {
         // Every vector replayed, by slot, until the index holds the live ones.
         let mut replayed: Vec<f32> = Vec::new();
         let store = CollectionStore::open(dir, store_options(&options), |op| match op {
-            Op::Upsert { id, vector } => {
+            Op::Upsert { id, vector, .. } => {
                 points.upsert(id);
                 replayed.extend_from_slice(vector);
             }
@@ -233,7 +233,11 @@ impl Collection {
         }
         let ops: Vec<Op<'_>> = points
             .iter()
-            .map(|&(id, vector)| Op::Upsert { id, vector })
+            .map(|&(id, vector)| Op::Upsert {
+                id,
+                vector,
+                payload: &[],
+            })
             .collect();
         self.store.write(&ops)?;
         let slots: Vec<(PointId, &[f32])> = points
@@ -419,7 +423,7 @@ enum Logged {
 impl From<Op<'_>> for Logged {
     fn from(op: Op<'_>) -> Self {
         match op {
-            Op::Upsert { id, vector } => Self::Upsert(id, vector.to_vec()),
+            Op::Upsert { id, vector, .. } => Self::Upsert(id, vector.to_vec()),
             Op::Delete { id } => Self::Delete(id),
         }
     }

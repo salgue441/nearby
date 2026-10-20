@@ -36,7 +36,7 @@ pub struct StoreOptions {
 ///
 /// let dir = tempfile::tempdir()?;
 /// let mut store = CollectionStore::create(dir.path(), 2, StoreOptions::default())?;
-/// store.write(&[Op::Upsert { id: 7, vector: &[1.0, 2.0] }])?;
+/// store.write(&[Op::Upsert { id: 7, vector: &[1.0, 2.0], payload: &[] }])?;
 /// drop(store);
 ///
 /// let mut ids = Vec::new();
@@ -297,7 +297,7 @@ mod tests {
     fn reopen(dir: &Path) -> (CollectionStore, BTreeMap<PointId, Vec<f32>>) {
         let mut points = BTreeMap::new();
         let store = CollectionStore::open(dir, StoreOptions::default(), |op| match op {
-            Op::Upsert { id, vector } => {
+            Op::Upsert { id, vector, .. } => {
                 points.insert(id, vector.to_vec());
             }
             Op::Delete { id } => {
@@ -313,6 +313,7 @@ mod tests {
             .write(&[Op::Upsert {
                 id,
                 vector: &[x, x],
+                payload: &[],
             }])
             .unwrap();
     }
@@ -445,10 +446,12 @@ mod tests {
                 Op::Upsert {
                     id: 1,
                     vector: &[1.0, 1.0],
+                    payload: &[],
                 },
                 Op::Upsert {
                     id: 2,
                     vector: &[1.0],
+                    payload: &[],
                 },
             ])
             .unwrap_err();
