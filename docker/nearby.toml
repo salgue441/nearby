@@ -1,0 +1,15 @@
+# Configuration for the Docker image. Mount a different file over
+# /etc/nearby/nearby.toml to change it; set the API key with NEARBY_API_KEY.
+
+data_dir = "/data"
+
+[server]
+# Inside a container, listen on every interface; publish the port to choose
+# who can reach it.
+listen = "0.0.0.0:7700"
+
+[log]
+# Containers log to stdout, one JSON object per line, for the runtime or a
+# log aggregator to collect.
+file = false
+console_format = "json"
