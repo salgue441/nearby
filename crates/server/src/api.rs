@@ -12,6 +12,7 @@
 //! | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
 //! | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.5, "payload": {...}}]}` |
 //! | `POST` | `/collections/{name}/search/batch` | `{"searches": [search, ...]}` | `{"results": [[...], ...]}` |
+//! | `GET` | `/metrics` | | request and collection metrics, Prometheus text format |
 //!
 //! Payloads are optional objects of booleans, numbers and strings; filters
 //! are described on `nearby_engine::Filter`.
@@ -25,7 +26,7 @@ use std::sync::{Arc, PoisonError};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequest, Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -36,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::auth::{ApiKey, require_api_key};
+use crate::metrics::{self, Metrics};
 
 /// Largest `k` a search may ask for.
 const MAX_K: usize = 10_000;
@@ -61,11 +63,24 @@ pub fn router(db: Db, options: ApiOptions) -> Router {
         .route("/collections/{name}/points/{id}", get(get_point))
         .route("/collections/{name}/search", post(search))
         .route("/collections/{name}/search/batch", post(search_batch));
+    let metrics = Arc::new(Metrics::default());
+    let exposition = Arc::clone(&metrics);
+    api = api.route(
+        "/metrics",
+        get(move |State(db): State<Db>| async move {
+            (
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                exposition.render(&db),
+            )
+        }),
+    );
     if let Some(key) = options.api_key {
         api = api.route_layer(middleware::from_fn_with_state(key, require_api_key));
     }
     // Health checks stay open, so load balancers need no key.
     api.route("/health", get(health))
+        // A route layer sees the matched route pattern, which `track` labels by.
+        .route_layer(middleware::from_fn_with_state(metrics, metrics::track))
         .layer(DefaultBodyLimit::max(options.max_body_bytes))
         .with_state(db)
 }
@@ -509,6 +524,8 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(status("/collections", Some("s3cret")).await, StatusCode::OK);
+        assert_eq!(status("/metrics", None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(status("/metrics", Some("s3cret")).await, StatusCode::OK);
         assert_eq!(
             status("/collections/missing", None).await,
             StatusCode::UNAUTHORIZED,
@@ -721,6 +738,48 @@ mod tests {
             )
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_count_requests_by_route_and_report_collections() {
+        let server = TestServer::new();
+        server.create_docs().await;
+        let points =
+            json!({ "points": [{ "id": 1, "vector": [0, 0] }, { "id": 2, "vector": [1, 1] }] });
+        server
+            .send(Method::PUT, "/collections/docs/points", Some(points))
+            .await;
+        for _ in 0..3 {
+            server
+                .send(Method::GET, "/collections/docs/points/1", None)
+                .await;
+        }
+        server
+            .send(Method::GET, "/collections/docs/points/9", None)
+            .await;
+
+        let request = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        let response = server.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain")
+        );
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        let route = r#"method="GET",route="/collections/{name}/points/{id}""#;
+        for line in [
+            format!(r#"nearby_requests_total{{{route},status="200"}} 3"#),
+            format!(r#"nearby_requests_total{{{route},status="404"}} 1"#),
+            r#"nearby_collection_points{collection="docs"} 2"#.to_owned(),
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line}\n{text}");
+        }
     }
 
     #[tokio::test]

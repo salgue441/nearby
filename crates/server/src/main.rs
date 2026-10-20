@@ -6,6 +6,7 @@
 mod api;
 mod auth;
 mod config;
+mod metrics;
 mod telemetry;
 
 use std::path::PathBuf;
