@@ -220,6 +220,9 @@ impl ProductQuantizer {
     }
 }
 
+/// Independent running sums in [`DistanceTable::distance`].
+const LANES: usize = 4;
+
 /// One query's distances to every centroid of every subspace.
 #[derive(Debug)]
 pub(super) struct DistanceTable {
@@ -231,17 +234,27 @@ pub(super) struct DistanceTable {
 
 impl DistanceTable {
     /// The approximate distance from the query to the vector `code` stands for.
+    ///
+    /// The lookups go into [`LANES`] independent sums. With a single running
+    /// sum, every addition would wait for the previous one to finish, and a
+    /// scan would be bound by addition latency instead of memory.
     #[inline]
     pub(super) fn distance(&self, code: &[u8]) -> f32 {
-        let sum: f32 = self
-            .entries
-            .as_chunks::<CENTROIDS>()
-            .0
+        let rows = self.entries.as_chunks::<CENTROIDS>().0;
+        let (rows, rows_tail) = rows.as_chunks::<LANES>();
+        let (codes, codes_tail) = code.as_chunks::<LANES>();
+        let mut acc = [0.0f32; LANES];
+        for (rows, codes) in rows.iter().zip(codes) {
+            for lane in 0..LANES {
+                acc[lane] += rows[lane][usize::from(codes[lane])];
+            }
+        }
+        let tail: f32 = rows_tail
             .iter()
-            .zip(code)
+            .zip(codes_tail)
             .map(|(row, &c)| row[usize::from(c)])
             .sum();
-        self.offset + sum
+        self.offset + acc.iter().sum::<f32>() + tail
     }
 }
 
