@@ -548,6 +548,7 @@ requests and flushes every collection before exiting.
 | `GET` | `/collections/{name}/points/{id}` | | `{"id": 1, "vector": [...], "payload": {...}}` |
 | `POST` | `/collections/{name}/search` | `{"vector": [...], "k": 10, "filter": {...}, "with_payload": true}` | `{"results": [{"id": 1, "distance": 0.12, "payload": {...}}]}` |
 | `POST` | `/collections/{name}/search/batch` | `{"searches": [search, ...]}`, up to 1,024 | `{"results": [[...], ...]}`, one list per search, in order |
+| `GET` | `/metrics` | | request counts and latencies by route, and each collection's points, segments and log length, in the Prometheus text format |
 
 - **Collection configs.** `metric` is `l2` (the default), `cosine` or `dot`.
   `index` is `{"type": "flat"}`, `{"type": "hnsw"}` (optionally with `m`,
