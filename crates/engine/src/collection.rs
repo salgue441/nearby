@@ -12,6 +12,7 @@ use crate::backend::{IndexBackend, new_index};
 use crate::config::CollectionConfig;
 use crate::points::PointTable;
 use crate::snapshot;
+use crate::vectors::VectorFile;
 
 /// The config's file name inside a collection directory.
 const CONFIG_FILE: &str = "collection.toml";
@@ -64,18 +65,15 @@ impl Collection {
         config: CollectionConfig,
         options: EngineOptions,
     ) -> Result<Self> {
-        if config.dim == 0 {
-            return Err(Error::InvalidParameter(
-                "dimension must be at least 1".to_owned(),
-            ));
-        }
-        let index = new_index(&config, 0)?;
+        config.validate()?;
         fs::create_dir_all(dir)?;
+        VectorFile::remove_leftovers(dir)?;
+        let index = new_index(&config, 0, dir)?;
         config.write(&dir.join(CONFIG_FILE))?;
         let store = CollectionStore::create(dir, config.dim, store_options(&options))?;
         Ok(Self {
             name: name.to_owned(),
-            points: PointTable::new(config.dim),
+            points: PointTable::new(),
             config,
             options,
             store,
@@ -95,31 +93,38 @@ impl Collection {
     /// loaded instead, and only the log written since is replayed.
     pub(crate) fn open(dir: &Path, name: &str, options: EngineOptions) -> Result<Self> {
         let config = CollectionConfig::read(&dir.join(CONFIG_FILE))?;
+        VectorFile::remove_leftovers(dir)?;
         let generation = CollectionStore::read_generation(dir)?;
         if let Some((points, index)) = snapshot::load(dir, &config, generation) {
             return Self::open_from_snapshot(dir, name, config, options, points, index);
         }
-        let mut points = PointTable::new(config.dim);
+        let mut points = PointTable::new();
+        // Every vector replayed, by slot, until the index holds the live ones.
+        let mut replayed: Vec<f32> = Vec::new();
         let store = CollectionStore::open(dir, store_options(&options), |op| match op {
             Op::Upsert { id, vector } => {
-                points.upsert(id, vector);
+                points.upsert(id);
+                replayed.extend_from_slice(vector);
             }
             Op::Delete { id } => {
                 points.delete(id);
             }
         })?;
         check_dim(&store, &config)?;
-        let mut collection = Self {
+        let dim = config.dim;
+        let (points, index) = build_index(&config, &options, dir, &points, |slot| {
+            let start = slot as usize * dim;
+            &replayed[start..start + dim]
+        })?;
+        Ok(Self {
             name: name.to_owned(),
-            index: new_index(&config, 0)?,
             config,
             options,
             store,
             points,
+            index,
             snapshot_generation: None,
-        };
-        collection.rebuild_index()?;
-        Ok(collection)
+        })
     }
 
     /// Opens a collection whose state at the current storage generation is
@@ -163,7 +168,7 @@ impl Collection {
         for op in ops {
             match op {
                 Logged::Upsert(id, vector) => {
-                    let slot = self.points.upsert(*id, vector);
+                    let slot = self.points.upsert(*id);
                     inserted.push((u64::from(slot), vector));
                 }
                 Logged::Delete(id) => {
@@ -207,7 +212,7 @@ impl Collection {
 
     /// Point `id`'s vector, if it exists.
     pub fn get(&self, id: PointId) -> Option<&[f32]> {
-        self.points.get(id)
+        self.points.slot(id).map(|slot| self.index.vector(slot))
     }
 
     /// Inserts `points`, replacing any that already exist. If an id appears
@@ -233,7 +238,7 @@ impl Collection {
         self.store.write(&ops)?;
         let slots: Vec<(PointId, &[f32])> = points
             .iter()
-            .map(|&(id, vector)| (u64::from(self.points.upsert(id, vector)), vector))
+            .map(|&(id, vector)| (u64::from(self.points.upsert(id)), vector))
             .collect();
         self.index.insert_batch(&slots, self.options.threads)?;
         self.maintain()
@@ -249,7 +254,7 @@ impl Collection {
         let mut existing: Vec<PointId> = ids
             .iter()
             .copied()
-            .filter(|&id| self.points.get(id).is_some())
+            .filter(|&id| self.points.slot(id).is_some())
             .collect();
         existing.sort_unstable();
         existing.dedup();
@@ -302,7 +307,7 @@ impl Collection {
     fn rerank(&self, query: &[f32], k: usize, candidates: &[ScoredPoint]) -> Vec<ScoredPoint> {
         let mut top = TopK::new(k);
         for hit in candidates {
-            let vector = self.points.vector(hit.id as u32);
+            let vector = self.index.vector(hit.id as u32);
             top.push(hit.id, self.config.metric.distance(query, vector));
         }
         top.into_sorted()
@@ -370,17 +375,38 @@ impl Collection {
 
     /// Drops dead slots and builds a fresh index over the live points.
     fn rebuild_index(&mut self) -> Result<()> {
-        self.points = self.points.compacted();
-        let mut index = new_index(&self.config, self.points.len())?;
-        let slots: Vec<(PointId, &[f32])> = self
-            .points
-            .live_slots()
-            .map(|(slot, vector)| (u64::from(slot), vector))
-            .collect();
-        index.insert_batch(&slots, self.options.threads)?;
+        let (points, index) = build_index(
+            &self.config,
+            &self.options,
+            self.store.dir(),
+            &self.points,
+            |slot| self.index.vector(slot),
+        )?;
+        self.points = points;
         self.index = index;
         Ok(())
     }
+}
+
+/// A compacted copy of `points` and a fresh index over its live points,
+/// reading each one's vector from `vector`.
+fn build_index<'v>(
+    config: &CollectionConfig,
+    options: &EngineOptions,
+    dir: &Path,
+    points: &PointTable,
+    vector: impl Fn(u32) -> &'v [f32],
+) -> Result<(PointTable, Box<dyn IndexBackend>)> {
+    let compacted = points.compacted();
+    let mut index = new_index(config, compacted.len(), dir)?;
+    // Slot `s` in the compacted table is the `s`-th live slot here.
+    let batch: Vec<(PointId, &[f32])> = points
+        .live_slots()
+        .enumerate()
+        .map(|(new_slot, slot)| (new_slot as PointId, vector(slot)))
+        .collect();
+    index.insert_batch(&batch, options.threads)?;
+    Ok((compacted, index))
 }
 
 /// An op replayed from the log, owned so it outlives the replay callback.
@@ -546,6 +572,43 @@ mod tests {
             Collection::open(dir.path(), "c", options).unwrap().len(),
             100
         );
+    }
+
+    /// Names of the vector spill files in `dir`.
+    fn spill_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("vectors-"))
+            .collect()
+    }
+
+    #[test]
+    fn pq_collections_keep_one_spill_file_through_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let pq = IndexConfig::Pq(PqConfig {
+            subspaces: 2,
+            training_points: 256,
+            rerank: 2,
+        });
+        let mut c = Collection::create(dir.path(), "c", config(pq), options()).unwrap();
+        let points: Vec<(PointId, [f32; 2])> =
+            (0..3_000u64).map(|id| (id, [id as f32, 1.0])).collect();
+        let batch: Vec<(PointId, &[f32])> = points.iter().map(|(id, v)| (*id, &v[..])).collect();
+        c.upsert(&batch).unwrap();
+        let before = spill_files(dir.path());
+        assert_eq!(before.len(), 1);
+
+        let doomed: Vec<PointId> = (0..2_000).collect();
+        c.delete(&doomed).unwrap();
+        assert_eq!(c.points.dead(), 0, "rebuilt");
+        let after = spill_files(dir.path());
+        assert_eq!(after.len(), 1, "the old file went with the old index");
+        assert_ne!(after, before);
+        assert_eq!(c.get(2_500), Some(&[2_500.0, 1.0][..]));
+
+        drop(c);
+        assert_eq!(spill_files(dir.path()), Vec::<String>::new());
     }
 
     #[test]

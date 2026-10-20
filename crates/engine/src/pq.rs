@@ -2,12 +2,14 @@
 //! quantizer, product-quantized codes after.
 
 use std::num::NonZeroUsize;
+use std::path::Path;
 
 use nearby_core::{Metric, PointId, Result, ScoredPoint};
 use nearby_index::{FlatIndex, PqIndex, PqParams, ProductQuantizer, VectorIndex};
 
 use crate::backend::IndexBackend;
 use crate::config::PqConfig;
+use crate::vectors::VectorFile;
 
 /// A [`PqIndex`] that trains itself once enough points have arrived.
 ///
@@ -17,6 +19,9 @@ use crate::config::PqConfig;
 /// `training_points` points, in insertion order, every point is encoded, and
 /// the flat index is dropped. Training on a fixed prefix keeps the result
 /// independent of how writes were batched.
+///
+/// The full vectors, needed for re-ranking and lookups, go to a
+/// [`VectorFile`] on disk, so once trained only the codes stay in memory.
 #[derive(Debug)]
 pub(crate) struct PqBackend {
     metric: Metric,
@@ -24,6 +29,7 @@ pub(crate) struct PqBackend {
     training_points: usize,
     rerank: NonZeroUsize,
     state: State,
+    vectors: VectorFile,
 }
 
 #[derive(Debug)]
@@ -34,14 +40,16 @@ enum State {
 }
 
 impl PqBackend {
-    /// An empty backend for `dim`-dimensional vectors.
+    /// An empty backend for `dim`-dimensional vectors, spilling them to `dir`.
     ///
     /// # Errors
     ///
-    /// [`nearby_core::Error::InvalidParameter`] if `config` doesn't fit `dim`.
-    pub(crate) fn new(dim: usize, metric: Metric, config: &PqConfig) -> Result<Self> {
+    /// [`nearby_core::Error::InvalidParameter`] if `config` doesn't fit `dim`,
+    /// or an I/O error creating the vector file.
+    pub(crate) fn new(dim: usize, metric: Metric, config: &PqConfig, dir: &Path) -> Result<Self> {
         config.validate(dim)?;
         Ok(Self {
+            vectors: VectorFile::create(dir, dim)?,
             metric,
             params: config.params(),
             training_points: config.training_points,
@@ -107,6 +115,8 @@ impl VectorIndex for PqBackend {
 
 impl IndexBackend for PqBackend {
     fn insert_batch(&mut self, points: &[(PointId, &[f32])], threads: NonZeroUsize) -> Result<()> {
+        self.vectors
+            .append(points.iter().map(|&(_, vector)| vector))?;
         match &mut self.state {
             State::Trained(pq) => pq.add_batch(points, threads),
             State::Collecting(flat) => {
@@ -123,7 +133,13 @@ impl IndexBackend for PqBackend {
                 }
                 Ok(())
             }
-        }
+        }?;
+        debug_assert_eq!(self.vectors.len(), self.len(), "one vector per slot");
+        Ok(())
+    }
+
+    fn vector(&self, slot: u32) -> &[f32] {
+        self.vectors.get(slot as usize)
     }
 
     fn rerank(&self) -> Option<NonZeroUsize> {
@@ -173,8 +189,9 @@ mod tests {
 
     #[test]
     fn searches_are_exact_until_training() {
+        let dir = tempfile::tempdir().unwrap();
         let data = points(299);
-        let mut backend = PqBackend::new(DIM, Metric::L2, &config(300)).unwrap();
+        let mut backend = PqBackend::new(DIM, Metric::L2, &config(300), dir.path()).unwrap();
         insert(&mut backend, &data, 100);
         assert!(!backend.is_trained());
         assert_eq!(backend.rerank(), None, "exact results need no re-ranking");
@@ -185,20 +202,27 @@ mod tests {
 
     #[test]
     fn the_quantizer_is_trained_once_enough_points_arrive() {
+        let dir = tempfile::tempdir().unwrap();
         let data = points(1_000);
-        let mut backend = PqBackend::new(DIM, Metric::L2, &config(300)).unwrap();
+        let mut backend = PqBackend::new(DIM, Metric::L2, &config(300), dir.path()).unwrap();
         insert(&mut backend, &data, 1_000);
         assert!(backend.is_trained());
         assert_eq!(backend.len(), 1_000, "every point is encoded");
+        assert_eq!(
+            backend.vector(123),
+            &data[123 * DIM..124 * DIM],
+            "full vectors come back from disk"
+        );
         assert_eq!(backend.rerank(), NonZeroUsize::new(3));
     }
 
     #[test]
     fn batching_does_not_change_the_trained_index() {
+        let dir = tempfile::tempdir().unwrap();
         let data = points(1_000);
-        let mut whole = PqBackend::new(DIM, Metric::L2, &config(300)).unwrap();
+        let mut whole = PqBackend::new(DIM, Metric::L2, &config(300), dir.path()).unwrap();
         insert(&mut whole, &data, 1_000);
-        let mut pieces = PqBackend::new(DIM, Metric::L2, &config(300)).unwrap();
+        let mut pieces = PqBackend::new(DIM, Metric::L2, &config(300), dir.path()).unwrap();
         insert(&mut pieces, &data, 7);
         for query in data.as_chunks::<DIM>().0.iter().step_by(50) {
             assert_eq!(
@@ -210,11 +234,12 @@ mod tests {
 
     #[test]
     fn bad_settings_are_rejected() {
-        assert!(PqBackend::new(DIM, Metric::L2, &config(10)).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(PqBackend::new(DIM, Metric::L2, &config(10), dir.path()).is_err());
         let odd = PqConfig {
             subspaces: 3,
             ..config(300)
         };
-        assert!(PqBackend::new(DIM, Metric::L2, &odd).is_err());
+        assert!(PqBackend::new(DIM, Metric::L2, &odd, dir.path()).is_err());
     }
 }

@@ -171,6 +171,7 @@ Each collection lives in its own directory, managed by a `CollectionStore`:
 data/collections/docs/
 ├── collection.toml   dimension, metric and index settings
 ├── index.snapshot    HNSW graph and id map, saved on shutdown (a cache)
+├── vectors-*.tmp     a PQ collection's full vectors, memory-mapped (scratch)
 ├── MANIFEST          which log and segments are live
 ├── wal-000007.log    writes since the last flush
 ├── seg-000004.seg    immutable batches of net changes, oldest first
@@ -216,8 +217,9 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   collection searches exactly until `training_points` points (default
   10,000) have been written, then trains on them and encodes every point.
   Each search then scans the codes for `rerank * k` candidates (default
-  `rerank = 10`) and returns the best `k` by exact distance, using the
-  full vectors the engine keeps anyway. On SIFT1M with 16 subspaces:
+  `rerank = 10`) and returns the best `k` by exact distance, reading the
+  candidates' full vectors from a memory-mapped scratch file. On SIFT1M
+  with 16 subspaces:
 
   | `rerank` | recall@10 |
   |---|---|
@@ -232,6 +234,11 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   collection isn't snapshotted: each start retrains, which takes 6 s here.
   HNSW searches are much faster, so PQ is for when build time or index
   memory matters more than latency.
+- **Memory.** Each vector is held once: by the index for flat and HNSW
+  collections, and for PQ in the scratch file, which the OS caches as
+  memory allows, so only the 16-byte codes stay in the process. With SIFT1M
+  loaded, the server process holds 856 MB for HNSW (was 1,370 MB, before
+  vectors stopped being kept twice) and 80 MB for PQ (was 591 MB).
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 

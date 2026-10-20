@@ -147,7 +147,7 @@ fn read(
     if index.len() != count || index.iter().enumerate().any(|(s, (id, _))| id != s as u64) {
         return Err(corrupt("index does not match the slot table"));
     }
-    let points = PointTable::from_slots(config.dim, &slots, index.iter().map(|(_, v)| v));
+    let points = PointTable::from_slots(&slots);
     Ok(Some((points, Box::new(index))))
 }
 
@@ -193,11 +193,11 @@ mod tests {
 
     /// Five points, one replaced and one deleted: 6 slots, 4 live.
     fn state() -> (PointTable, Box<dyn IndexBackend>) {
-        let mut points = PointTable::new(2);
-        let mut index = new_index(&config(), 0).unwrap();
+        let mut points = PointTable::new();
+        let mut index = new_index(&config(), 0, Path::new(".")).unwrap();
         let mut add = |points: &mut PointTable, id: PointId, x: f32| {
             let v = [x, x];
-            let slot = points.upsert(id, &v);
+            let slot = points.upsert(id);
             index
                 .insert_batch(&[(u64::from(slot), &v)], NonZeroUsize::MIN)
                 .unwrap();
@@ -218,8 +218,9 @@ mod tests {
 
         let (loaded, loaded_index) = load(dir.path(), &config(), 7).unwrap();
         assert_eq!((loaded.len(), loaded.slot_count()), (4, 6));
-        assert_eq!(loaded.get(2), Some(&[20.0, 20.0][..]));
-        assert_eq!(loaded.get(4), None);
+        let slot = loaded.slot(2).unwrap();
+        assert_eq!(loaded_index.vector(slot), &[20.0, 20.0]);
+        assert_eq!(loaded.slot(4), None);
         assert_eq!(
             loaded_index.search(&[1.0, 1.0], 6).unwrap(),
             index.search(&[1.0, 1.0], 6).unwrap()
@@ -256,8 +257,8 @@ mod tests {
             index: IndexConfig::Flat,
             ..config()
         };
-        let index = new_index(&flat, 0).unwrap();
-        assert!(!save(dir.path(), 1, &PointTable::new(2), index.as_ref()).unwrap());
+        let index = new_index(&flat, 0, dir.path()).unwrap();
+        assert!(!save(dir.path(), 1, &PointTable::new(), index.as_ref()).unwrap());
         assert!(!path(dir.path()).exists());
     }
 

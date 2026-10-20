@@ -25,6 +25,7 @@ mod database;
 mod points;
 mod pq;
 mod snapshot;
+mod vectors;
 
 use std::num::NonZeroUsize;
 
