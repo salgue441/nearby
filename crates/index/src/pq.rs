@@ -25,3 +25,27 @@ pub use self::quantizer::ProductQuantizer;
 
 /// Centroids per subspace. 256 makes every code exactly one byte.
 const CENTROIDS: usize = 256;
+
+/// Squared Euclidean distance between two subspace slices.
+///
+/// Slices are only a few values long (8 for 128-d vectors in 16 subspaces).
+/// The runtime-dispatched kernels in `nearby_core::distance` are built for
+/// whole vectors, and on slices this short they mostly cost their call
+/// overhead. A plain loop inlines into its caller instead.
+#[inline]
+fn slice_l2(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+/// Dot product of two subspace slices; see [`slice_l2`] for why this
+/// doesn't use `nearby_core::distance::dot`.
+#[inline]
+fn slice_dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}

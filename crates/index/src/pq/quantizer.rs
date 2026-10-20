@@ -2,11 +2,11 @@
 
 use std::num::NonZeroUsize;
 
-use nearby_core::distance::{dot, l2_squared, normalize};
+use nearby_core::distance::normalize;
 use nearby_core::{Error, Metric, Result, validate_vector};
 
 use super::kmeans::{kmeans, nearest};
-use super::{CENTROIDS, PqParams};
+use super::{CENTROIDS, PqParams, slice_dot, slice_l2};
 use crate::parallel::parallel_map;
 
 /// Compresses vectors into `subspaces`-byte codes, one byte per slice.
@@ -203,8 +203,8 @@ impl ProductQuantizer {
         for (s, slice) in query.chunks_exact(sub_dim).enumerate() {
             entries.extend(self.codebook(s).chunks_exact(sub_dim).map(
                 |centroid| match self.metric {
-                    Metric::L2 => l2_squared(slice, centroid),
-                    Metric::Dot | Metric::Cosine => -dot(slice, centroid),
+                    Metric::L2 => slice_l2(slice, centroid),
+                    Metric::Dot | Metric::Cosine => -slice_dot(slice, centroid),
                 },
             ));
         }
@@ -249,6 +249,7 @@ impl DistanceTable {
 mod tests {
     use super::*;
     use crate::rng::SplitMix64;
+    use nearby_core::distance::{dot, l2_squared};
 
     fn random(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut rng = SplitMix64::new(seed);

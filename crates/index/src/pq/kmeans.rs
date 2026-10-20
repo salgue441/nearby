@@ -1,6 +1,6 @@
 //! k-means clustering (Lloyd's algorithm), deterministic for a given seed.
 
-use nearby_core::distance::l2_squared;
+use super::slice_l2;
 
 use crate::rng::SplitMix64;
 
@@ -52,14 +52,14 @@ fn initial_centroids(points: &[f32], dim: usize, k: usize, seed: u64) -> Vec<f32
     centroids.extend_from_slice(first);
     let mut distances: Vec<f32> = points
         .chunks_exact(dim)
-        .map(|p| l2_squared(p, first))
+        .map(|p| slice_l2(p, first))
         .collect();
 
     while centroids.len() < k * dim {
         let picked = point(points, dim, weighted_pick(&distances, &mut rng));
         centroids.extend_from_slice(picked);
         for (d, p) in distances.iter_mut().zip(points.chunks_exact(dim)) {
-            *d = d.min(l2_squared(p, picked));
+            *d = d.min(slice_l2(p, picked));
         }
     }
     centroids
@@ -109,7 +109,7 @@ fn assign(
 pub(super) fn nearest(centroids: &[f32], dim: usize, p: &[f32]) -> (u32, f32) {
     let mut best = (0, f32::INFINITY);
     for (c, centroid) in centroids.chunks_exact(dim).enumerate() {
-        let d = l2_squared(p, centroid);
+        let d = slice_l2(p, centroid);
         if d < best.1 {
             best = (c as u32, d);
         }
