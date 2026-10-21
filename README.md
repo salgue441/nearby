@@ -573,7 +573,7 @@ On a 16-thread i7-11800H (Linux container), medians:
 | Benchmark | Time |
 |---|---:|
 | `dot` / `l2_squared`, 768-d | 37 ns (20 G elements/s) |
-| `cosine`, 768-d | 113 ns |
+| `cosine`, 768-d | 56 ns |
 | Search 20k × 128-d, k = 10: flat | 332 µs |
 | Search 20k × 128-d, k = 10: HNSW, `ef` 64 | 55 µs |
 | Search 20k × 128-d, k = 10: PQ | 160 µs |
