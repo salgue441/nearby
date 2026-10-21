@@ -92,6 +92,47 @@ pub(super) fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// `[a·b, a·a, b·b]` over the first `min(a.len(), b.len())` values, in one
+/// pass.
+///
+/// Each sum runs through the same operations in the same order as [`dot`]
+/// would, so each value has the same bits as the matching `dot` call. The
+/// 12 accumulators and 2 loaded values fit in the 16 AVX registers.
+#[target_feature(enable = "avx2,fma")]
+pub(super) fn dot_and_squared_norms(a: &[f32], b: &[f32]) -> [f32; 3] {
+    let n = a.len().min(b.len());
+    let (a8, a_tail) = a[..n].as_chunks::<8>();
+    let (b8, b_tail) = b[..n].as_chunks::<8>();
+    let (a32, a8_rest) = a8.as_chunks::<4>();
+    let (b32, b8_rest) = b8.as_chunks::<4>();
+
+    let mut ab = [_mm256_setzero_ps(); 4];
+    let mut aa = [_mm256_setzero_ps(); 4];
+    let mut bb = [_mm256_setzero_ps(); 4];
+    for (xs, ys) in a32.iter().zip(b32) {
+        for k in 0..4 {
+            let (xv, yv) = (load(&xs[k]), load(&ys[k]));
+            ab[k] = _mm256_fmadd_ps(xv, yv, ab[k]);
+            aa[k] = _mm256_fmadd_ps(xv, xv, aa[k]);
+            bb[k] = _mm256_fmadd_ps(yv, yv, bb[k]);
+        }
+    }
+    for (x, y) in a8_rest.iter().zip(b8_rest) {
+        let (xv, yv) = (load(x), load(y));
+        ab[0] = _mm256_fmadd_ps(xv, yv, ab[0]);
+        aa[0] = _mm256_fmadd_ps(xv, xv, aa[0]);
+        bb[0] = _mm256_fmadd_ps(yv, yv, bb[0]);
+    }
+
+    let mut sums = [horizontal_sum(ab), horizontal_sum(aa), horizontal_sum(bb)];
+    for (x, y) in a_tail.iter().zip(b_tail) {
+        sums[0] += x * y;
+        sums[1] += x * x;
+        sums[2] += y * y;
+    }
+    sums
+}
+
 /// Loads 8 floats into a register.
 #[inline]
 #[target_feature(enable = "avx")]

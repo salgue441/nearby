@@ -3,8 +3,8 @@
 //! These are the hottest functions in the whole database: a single search
 //! calls them thousands of times.
 //!
-//! [`dot`] and [`l2_squared`] (and everything built on them) pick a kernel at
-//! runtime:
+//! [`dot`], [`l2_squared`] and [`cosine_distance`] (and everything built
+//! on them) pick a kernel at runtime:
 //!
 //! - **x86-64 with AVX2 and FMA:** hand-written SIMD kernels, about 2x faster.
 //!   The default x86-64 target only guarantees SSE2, so the CPU is checked
@@ -55,7 +55,8 @@ impl Metric {
 /// 8 `f32`s fill one AVX register, or two SSE registers.
 const LANES: usize = 8;
 
-/// `sum(term(a[i], b[i]))`, written so the compiler can vectorize it.
+/// `sum(term(a[i], b[i]))` for each of the `N` values `term` returns,
+/// written so the compiler can vectorize it.
 ///
 /// Float addition is not associative, so LLVM may not reorder a plain
 /// `.iter().sum()` into SIMD lanes: every addition waits for the previous
@@ -63,23 +64,36 @@ const LANES: usize = 8;
 /// which lets it vectorize (about 3x faster on 128-d vectors).
 ///
 /// The summation order differs from a left-to-right sum, so results can
-/// differ from it in the last bits.
+/// differ from it in the last bits. Each of the `N` sums is computed exactly
+/// as it would be on its own, so one call returning several sums gives the
+/// same bits as separate calls.
 #[inline]
-fn sum_lanes(a: &[f32], b: &[f32], term: impl Fn(f32, f32) -> f32) -> f32 {
+fn sum_lanes<const N: usize>(
+    a: &[f32],
+    b: &[f32],
+    term: impl Fn(f32, f32) -> [f32; N],
+) -> [f32; N] {
     debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
 
     let (a_chunks, a_tail) = a.as_chunks::<LANES>();
     let (b_chunks, b_tail) = b.as_chunks::<LANES>();
 
-    let mut acc = [0.0f32; LANES];
+    let mut acc = [[0.0f32; LANES]; N];
     for (x, y) in a_chunks.iter().zip(b_chunks) {
         for i in 0..LANES {
-            acc[i] += term(x[i], y[i]);
+            for (sums, t) in acc.iter_mut().zip(term(x[i], y[i])) {
+                sums[i] += t;
+            }
         }
     }
 
-    let tail: f32 = a_tail.iter().zip(b_tail).map(|(&x, &y)| term(x, y)).sum();
-    acc.iter().sum::<f32>() + tail
+    let mut tail = [-0.0f32; N];
+    for (&x, &y) in a_tail.iter().zip(b_tail) {
+        for (sum, t) in tail.iter_mut().zip(term(x, y)) {
+            *sum += t;
+        }
+    }
+    std::array::from_fn(|j| acc[j].iter().sum::<f32>() + tail[j])
 }
 
 /// Dot product: `sum(a[i] * b[i])`.
@@ -114,16 +128,40 @@ pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
 /// [`dot`] for CPUs without a SIMD kernel.
 #[inline]
 fn dot_portable(a: &[f32], b: &[f32]) -> f32 {
-    sum_lanes(a, b, |x, y| x * y)
+    let [ab] = sum_lanes(a, b, |x, y| [x * y]);
+    ab
 }
 
 /// [`l2_squared`] for CPUs without a SIMD kernel.
 #[inline]
 fn l2_squared_portable(a: &[f32], b: &[f32]) -> f32 {
-    sum_lanes(a, b, |x, y| {
+    let [d2] = sum_lanes(a, b, |x, y| {
         let d = x - y;
-        d * d
-    })
+        [d * d]
+    });
+    d2
+}
+
+/// `[dot(a, b), dot(a, a), dot(b, b)]` in one pass over both slices.
+///
+/// Each value has the same bits as the matching [`dot`] call, so a cosine
+/// computed from them matches one computed from [`norm`]s exactly.
+/// Uses AVX2 and FMA when the CPU supports them (see the module docs).
+#[inline]
+fn dot_and_squared_norms(a: &[f32], b: &[f32]) -> [f32; 3] {
+    debug_assert_eq!(a.len(), b.len(), "vectors must have the same dimension");
+    #[cfg(target_arch = "x86_64")]
+    if x86::available() {
+        // SAFETY: `available` confirmed that this CPU supports AVX2 and FMA.
+        return unsafe { x86::dot_and_squared_norms(a, b) };
+    }
+    dot_and_squared_norms_portable(a, b)
+}
+
+/// [`dot_and_squared_norms`] for CPUs without a SIMD kernel.
+#[inline]
+fn dot_and_squared_norms_portable(a: &[f32], b: &[f32]) -> [f32; 3] {
+    sum_lanes(a, b, |x, y| [x * y, x * x, y * y])
 }
 
 /// Euclidean length of `v`.
@@ -136,9 +174,13 @@ pub fn norm(v: &[f32]) -> f32 {
 ///
 /// A zero vector has no direction, so by convention it is treated as
 /// orthogonal to everything and gets distance `1.0`.
+///
+/// Computes the dot product and both norms in one pass over the slices, so
+/// it costs little more than one [`dot`].
 #[inline]
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    cosine_distance_with_norms(a, b, norm(a), norm(b))
+    let [ab, aa, bb] = dot_and_squared_norms(a, b);
+    cosine_from_parts(ab, aa.sqrt(), bb.sqrt())
 }
 
 /// [`cosine_distance`] with the norms already known, so a comparison costs
@@ -150,12 +192,18 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 /// the same as [`cosine_distance`].
 #[inline]
 pub fn cosine_distance_with_norms(a: &[f32], b: &[f32], norm_a: f32, norm_b: f32) -> f32 {
+    cosine_from_parts(dot(a, b), norm_a, norm_b)
+}
+
+/// Cosine distance from a dot product and the two norms.
+#[inline]
+fn cosine_from_parts(dot: f32, norm_a: f32, norm_b: f32) -> f32 {
     let denom = norm_a * norm_b;
     if denom <= f32::MIN_POSITIVE {
         return 1.0;
     }
 
-    (1.0 - dot(a, b) / denom).clamp(0.0, 2.0)
+    (1.0 - dot / denom).clamp(0.0, 2.0)
 }
 
 /// Scales `v` in place to unit length. Leaves a zero vector unchanged.
@@ -332,6 +380,10 @@ mod tests {
                 assert_eq!(x86::dot(&long, &short), expected, "len {short_len}");
                 assert_eq!(x86::dot(&short, &long), expected, "len {short_len}");
                 assert_eq!(x86::l2_squared(&long, &short), short_len as f32);
+                assert_eq!(
+                    x86::dot_and_squared_norms(&long, &short),
+                    [expected, short_len as f32, 2.0 * expected]
+                );
             }
         }
     }
@@ -346,6 +398,31 @@ mod tests {
                 cosine_distance(&a, &b).to_bits(),
                 "n={n}"
             );
+        }
+    }
+
+    #[test]
+    fn fused_kernels_match_separate_dot_products_exactly() {
+        type Fused = fn(&[f32], &[f32]) -> [f32; 3];
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        let mut fused: Vec<(&str, Fused, Kernel)> =
+            vec![("portable", dot_and_squared_norms_portable, dot_portable)];
+        #[cfg(target_arch = "x86_64")]
+        if x86::available() {
+            // SAFETY (both closures): this CPU supports AVX2 and FMA.
+            fused.push((
+                "avx2",
+                |a, b| unsafe { x86::dot_and_squared_norms(a, b) },
+                |a, b| unsafe { x86::dot(a, b) },
+            ));
+        }
+        for (name, fused, dot) in fused {
+            for n in lengths() {
+                let a = pseudo_random(n, 5 + n as u64);
+                let b = pseudo_random(n, 55 + n as u64);
+                let expected = [dot(&a, &b), dot(&a, &a), dot(&b, &b)].map(f32::to_bits);
+                assert_eq!(fused(&a, &b).map(f32::to_bits), expected, "{name} n={n}");
+            }
         }
     }
 
