@@ -20,6 +20,7 @@
 
 mod backend;
 mod collection;
+mod columns;
 mod config;
 mod database;
 mod filter;

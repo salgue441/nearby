@@ -122,6 +122,7 @@ fn filtered_searches(c: &mut Criterion) {
     };
     let cases = [
         ("no filter", None),
+        ("filter keeps 100%", Some(below(100.0))),
         ("filter keeps 50%", Some(below(50.0))),
         ("filter keeps 10%", Some(below(10.0))),
         ("filter keeps 1%", Some(below(1.0))),

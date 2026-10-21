@@ -66,7 +66,7 @@ pub struct Range {
 }
 
 impl Range {
-    fn contains(&self, x: f64) -> bool {
+    pub(crate) fn contains(&self, x: f64) -> bool {
         self.gt.is_none_or(|b| x > b)
             && self.gte.is_none_or(|b| x >= b)
             && self.lt.is_none_or(|b| x < b)

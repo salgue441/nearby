@@ -114,7 +114,7 @@ impl Collection {
                     bad_payload.get_or_insert(err);
                     None
                 });
-                points.upsert(id, payload);
+                points.upsert(id, payload.as_ref());
                 replayed.extend_from_slice(vector);
             }
             Op::Delete { id } => {
@@ -182,7 +182,7 @@ impl Collection {
         for op in ops {
             match op {
                 Logged::Upsert(id, vector, payload) => {
-                    let slot = self.points.upsert(*id, payload::decode(payload)?);
+                    let slot = self.points.upsert(*id, payload::decode(payload)?.as_ref());
                     inserted.push((u64::from(slot), vector));
                 }
                 Logged::Delete(id) => {
@@ -230,7 +230,10 @@ impl Collection {
     }
 
     /// Point `id`'s payload, if it exists and has one.
-    pub fn payload(&self, id: PointId) -> Option<&Payload> {
+    ///
+    /// Payloads are stored by field, not as one map per point (that keeps
+    /// filtered searches fast), so this assembles a new [`Payload`].
+    pub fn payload(&self, id: PointId) -> Option<Payload> {
         self.points.payload(id)
     }
 
@@ -283,7 +286,7 @@ impl Collection {
         let slots: Vec<(PointId, &[f32])> = points
             .iter()
             .map(|&(id, vector, payload)| {
-                let slot = self.points.upsert(id, payload.cloned());
+                let slot = self.points.upsert(id, payload);
                 (u64::from(slot), vector)
             })
             .collect();
@@ -350,10 +353,10 @@ impl Collection {
         validate_vector(query, self.config.dim)?;
         let rerank = self.index.rerank();
         let candidates = rerank.map_or(k, |factor| k.saturating_mul(factor.get()));
+        let compiled = filter.map(|f| self.points.compile(f));
         let keep = |slot: PointId| {
-            self.points
-                .live_id(slot as u32)
-                .is_some_and(|id| filter.is_none_or(|f| f.matches(self.points.payload(id))))
+            let slot = slot as u32;
+            self.points.is_live(slot) && compiled.as_ref().is_none_or(|f| f.matches(slot))
         };
         let mut hits = if self.points.dead() == 0 && filter.is_none() {
             self.index.search(query, candidates)?
@@ -634,16 +637,16 @@ mod tests {
             drop(c);
 
             let mut c = Collection::open(dir.path(), "c", options()).unwrap();
-            assert_eq!(c.payload(1), Some(&en));
+            assert_eq!(c.payload(1), Some(en.clone()));
             assert_eq!(c.payload(2), None);
-            assert_eq!(c.payload(4), Some(&es));
+            assert_eq!(c.payload(4), Some(es.clone()));
             assert_eq!(search(&c, &lang("es")), vec![4]);
             assert_eq!(search(&c, &untagged), vec![2, 3]);
 
             c.checkpoint().unwrap();
             drop(c);
             let c = Collection::open(dir.path(), "c", options()).unwrap();
-            assert_eq!(c.payload(4), Some(&es), "through a snapshot too");
+            assert_eq!(c.payload(4), Some(es.clone()), "through a snapshot too");
             assert_eq!(search(&c, &lang("es")), vec![4]);
         }
     }
