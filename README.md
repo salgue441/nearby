@@ -295,15 +295,22 @@ index (`flat`, `hnsw` or `pq`, with its parameters).
   checked as each candidate is reached, so the index keeps searching until
   it finds `k` matches. HNSW walks through rejected points to reach matching
   ones: recall stays high, but the more a filter rejects, the more of the
-  graph a search visits. SIFT1M, HNSW defaults, 200 queries:
+  graph a search visits. Payloads are stored by field, one column per field
+  indexed by slot, with strings interned, and a filter is compiled once per
+  search; checking a point reads one 16-byte cell per condition, which stays
+  in cache, instead of chasing pointers through a map per point. SIFT1M,
+  HNSW defaults, 200 queries, in a Linux container:
 
   | Filter keeps | recall@10 | Mean latency |
   |---|---|---|
-  | every point (no filter) | 0.9700 | 0.31 ms |
-  | 10% | 0.9985 | 4.4 ms |
-  | 1% | 1.0000 | 33.7 ms |
+  | every point (no filter) | 0.9695 | 0.40 ms |
+  | every point (a filter that always matches) | 0.9695 | 0.52 ms |
+  | 50% | 0.9865 | 0.85 ms |
+  | 10% | 0.9985 | 2.8 ms |
+  | 1% | 1.0000 | 17.7 ms |
 
-  At 1% a search costs about as much as an exact scan.
+  Before payloads were stored by field, the 10% and 1% rows took 4.2 and
+  29 ms.
 - **Concurrency.** Each collection has its own read-write lock: searches run
   alongside each other, and writes to one collection don't block others.
 
@@ -573,7 +580,7 @@ On a 16-thread i7-11800H (Linux container), medians:
 | Benchmark | Time |
 |---|---:|
 | `dot` / `l2_squared`, 768-d | 37 ns (20 G elements/s) |
-| `cosine`, 768-d | 113 ns |
+| `cosine`, 768-d | 56 ns |
 | Search 20k × 128-d, k = 10: flat | 332 µs |
 | Search 20k × 128-d, k = 10: HNSW, `ef` 64 | 55 µs |
 | Search 20k × 128-d, k = 10: PQ | 160 µs |
@@ -583,10 +590,11 @@ On a 16-thread i7-11800H (Linux container), medians:
 | Upsert 1,000 points with payloads (no sync): flat | 1.2 ms |
 | Upsert 1,000 points with payloads (no sync): HNSW | 24 ms |
 | HNSW search 20k × 64-d: no filter | 46 µs |
-| HNSW search 20k × 64-d: filter keeps 50% | 159 µs |
-| HNSW search 20k × 64-d: filter keeps 10% | 604 µs |
-| HNSW search 20k × 64-d: filter keeps 1% | 2.8 ms |
+| HNSW search 20k × 64-d: filter keeps 100% / 50% / 10% / 1% | 1.15× / 2.0× / 5.4× / 18× the unfiltered time¹ |
 | `Filter::matches` (a range and an equality) | 20 ns |
+
+¹ Measured as ratios to an unfiltered search in the same run, because the
+host was slower that day (an unfiltered search took 87 µs).
 
 ## Server
 

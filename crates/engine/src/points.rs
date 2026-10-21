@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use nearby_core::PointId;
 
+use crate::columns::{CompiledFilter, PayloadColumns};
+use crate::filter::Filter;
 use crate::payload::Payload;
 
 /// Every slot a collection's index holds, a map from point id to the slot
@@ -20,8 +22,8 @@ pub(crate) struct PointTable {
     live: Vec<bool>,
     /// The live slot of every point.
     slots: HashMap<PointId, u32>,
-    /// The payload of every live point that has one.
-    payloads: HashMap<PointId, Payload>,
+    /// The payload of every live slot whose point has one.
+    payloads: PayloadColumns,
 }
 
 impl PointTable {
@@ -46,16 +48,15 @@ impl PointTable {
 
     /// Gives point `id` a new slot, which it returns, and `payload`. A slot
     /// the point had before becomes dead, and its old payload is dropped.
-    pub(crate) fn upsert(&mut self, id: PointId, payload: Option<Payload>) -> u32 {
-        match payload {
-            Some(payload) => self.payloads.insert(id, payload),
-            None => self.payloads.remove(&id),
-        };
+    pub(crate) fn upsert(&mut self, id: PointId, payload: Option<&Payload>) -> u32 {
         let slot = u32::try_from(self.ids.len()).expect("fewer than 2^32 slots");
         self.ids.push(id);
         self.live.push(true);
         if let Some(old) = self.slots.insert(id, slot) {
-            self.live[old as usize] = false;
+            self.kill(old);
+        }
+        if let Some(payload) = payload {
+            self.payloads.insert(slot, payload);
         }
         slot
     }
@@ -65,9 +66,14 @@ impl PointTable {
         let Some(slot) = self.slots.remove(&id) else {
             return false;
         };
-        self.payloads.remove(&id);
-        self.live[slot as usize] = false;
+        self.kill(slot);
         true
+    }
+
+    /// Marks `slot` dead and drops its payload.
+    fn kill(&mut self, slot: u32) {
+        self.live[slot as usize] = false;
+        self.payloads.remove(slot);
     }
 
     /// The slot holding point `id`'s current vector.
@@ -76,19 +82,35 @@ impl PointTable {
     }
 
     /// Point `id`'s payload, if it is live and has one.
-    pub(crate) fn payload(&self, id: PointId) -> Option<&Payload> {
-        self.payloads.get(&id)
+    pub(crate) fn payload(&self, id: PointId) -> Option<Payload> {
+        self.payload_at(self.slot(id)?)
     }
 
-    /// Every payload, by point id.
-    pub(crate) fn payloads(&self) -> &HashMap<PointId, Payload> {
-        &self.payloads
+    /// The payload of the point in `slot`, if the slot is live and the point
+    /// has one.
+    pub(crate) fn payload_at(&self, slot: u32) -> Option<Payload> {
+        self.payloads.get(slot)
+    }
+
+    /// `filter` resolved against this table's payloads, to check slots with.
+    pub(crate) fn compile(&self, filter: &Filter) -> CompiledFilter<'_> {
+        self.payloads.compile(filter)
+    }
+
+    /// Every live point's payload, in slot order.
+    pub(crate) fn payloads(&self) -> impl Iterator<Item = (PointId, Payload)> {
+        self.live_slots()
+            .filter_map(|slot| Some((self.ids[slot as usize], self.payload_at(slot)?)))
+    }
+
+    /// Whether `slot` holds a point's current vector.
+    pub(crate) fn is_live(&self, slot: u32) -> bool {
+        self.live.get(slot as usize).copied().unwrap_or(false)
     }
 
     /// The point in `slot`, if the slot is live.
     pub(crate) fn live_id(&self, slot: u32) -> Option<PointId> {
-        let s = slot as usize;
-        (*self.live.get(s)?).then(|| self.ids[s])
+        self.is_live(slot).then(|| self.ids[slot as usize])
     }
 
     /// Every live slot, in order.
@@ -110,14 +132,13 @@ impl PointTable {
     ) -> Self {
         let mut table = Self::new();
         for &(id, live) in slots {
-            let slot = table.upsert(id, None);
-            if !live {
-                table.live[slot as usize] = false;
-                table.slots.remove(&id);
+            if live {
+                table.upsert(id, payloads.remove(&id).as_ref());
+            } else {
+                table.ids.push(id);
+                table.live.push(false);
             }
         }
-        payloads.retain(|id, _| table.slots.contains_key(id));
-        table.payloads = payloads;
         table
     }
 
@@ -126,9 +147,8 @@ impl PointTable {
     pub(crate) fn compacted(&self) -> Self {
         let mut table = Self::new();
         for slot in self.live_slots() {
-            table.upsert(self.ids[slot as usize], None);
+            table.upsert(self.ids[slot as usize], self.payload_at(slot).as_ref());
         }
-        table.payloads.clone_from(&self.payloads);
         table
     }
 }
@@ -197,24 +217,24 @@ mod tests {
             )]))
         };
         let mut t = PointTable::new();
-        t.upsert(1, tagged("a"));
-        t.upsert(2, tagged("b"));
+        t.upsert(1, tagged("a").as_ref());
+        t.upsert(2, tagged("b").as_ref());
         t.upsert(3, None);
-        assert_eq!(t.payload(1), tagged("a").as_ref());
+        assert_eq!(t.payload(1), tagged("a"));
         assert_eq!(t.payload(3), None);
 
         t.upsert(1, None);
         assert_eq!(t.payload(1), None, "a replacement drops the old payload");
         t.delete(2);
         assert_eq!(t.payload(2), None);
-        t.upsert(3, tagged("c"));
-        assert_eq!(t.compacted().payload(3), tagged("c").as_ref());
+        t.upsert(3, tagged("c").as_ref());
+        assert_eq!(t.compacted().payload(3), tagged("c"));
 
         let slots: Vec<(PointId, bool)> = t.slots().collect();
-        let mut payloads = t.payloads().clone();
+        let mut payloads: HashMap<PointId, Payload> = t.payloads().collect();
         payloads.insert(2, tagged("stale").unwrap());
         let r = PointTable::from_slots(&slots, payloads);
-        assert_eq!(r.payload(3), tagged("c").as_ref());
+        assert_eq!(r.payload(3), tagged("c"));
         assert_eq!(r.payload(2), None, "payloads of dead points are dropped");
     }
 
