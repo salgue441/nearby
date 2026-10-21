@@ -205,7 +205,7 @@ async fn get_point(
     Ok(Json(PointBody {
         id,
         vector: vector.to_vec(),
-        payload: collection.payload(id).cloned(),
+        payload: collection.payload(id),
     }))
 }
 
@@ -267,7 +267,7 @@ fn run_search(collection: &Collection, request: &SearchRequest) -> nearby_core::
             distance: p.distance,
             payload: request
                 .with_payload
-                .then(|| collection.payload(p.id).cloned())
+                .then(|| collection.payload(p.id))
                 .flatten(),
         })
         .collect())

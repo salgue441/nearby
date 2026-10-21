@@ -61,11 +61,11 @@ pub(crate) fn save(
             header.write_all(&id.to_le_bytes())?;
             header.write_all(&[u8::from(live)])?;
         }
-        let mut payloads: Vec<(&PointId, &Payload)> = points.payloads().iter().collect();
-        payloads.sort_unstable_by_key(|&(id, _)| *id);
+        let mut payloads: Vec<(PointId, Payload)> = points.payloads().collect();
+        payloads.sort_unstable_by_key(|&(id, _)| id);
         header.write_all(&(payloads.len() as u64).to_le_bytes())?;
         for (id, payload) in payloads {
-            let bytes = payload::encode(payload)?;
+            let bytes = payload::encode(&payload)?;
             header.write_all(&id.to_le_bytes())?;
             header.write_all(&(bytes.len() as u32).to_le_bytes())?;
             header.write_all(&bytes)?;
@@ -223,7 +223,7 @@ mod tests {
         let mut add = |points: &mut PointTable, id: PointId, x: f32| {
             let v = [x, x];
             let tag = Payload::from([("tag".to_owned(), Value::String(format!("{id}")))]);
-            let slot = points.upsert(id, (id == 1).then_some(tag));
+            let slot = points.upsert(id, (id == 1).then_some(&tag));
             index
                 .insert_batch(&[(u64::from(slot), &v)], NonZeroUsize::MIN)
                 .unwrap();
@@ -247,7 +247,10 @@ mod tests {
         let slot = loaded.slot(2).unwrap();
         assert_eq!(loaded_index.vector(slot), &[20.0, 20.0]);
         assert_eq!(loaded.slot(4), None);
-        assert_eq!(loaded.payloads(), points.payloads(), "payloads come back");
+        assert!(
+            loaded.payloads().eq(points.payloads()),
+            "payloads come back"
+        );
         assert!(loaded.payload(1).is_some());
         assert_eq!(
             loaded_index.search(&[1.0, 1.0], 6).unwrap(),
